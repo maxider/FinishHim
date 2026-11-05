@@ -1,0 +1,9 @@
+## Interface: 16001
+## Title: FinishHim
+## Notes: Shows, for every combo point count, whether Eviscerate would kill your target right now, so you know when to finish and how few points you need (/fh).
+## Version: v0.1.0
+## SavedVariables: FinishHimDB
+## OptionalDeps: DoesItDie
+
+Core.lua
+Display.lua
