@@ -1,9 +1,10 @@
 # FinishHim
 
-WoW addon for **WoW: Forever** (`## Interface: 16001`). For each spell the player picks (`/fh add`), it shows whether
-casting it would kill the target, at each combo point count (1-5). Eviscerate is tracked by default. Only combo
-point spells are supported so far, but the code is built so spells without combo points can be added later. Modeled on the DoesItDie addon next door (`../DoesItDie`), which solves
-the same problems for DoTs. Check there first when unsure how Forever behaves.
+WoW addon for **WoW: Forever** (`## Interface: 16001`). For each spell the player picks (`/fh add` or the options
+window), it shows whether casting it would kill the target. Combo point spells (Eviscerate, tracked by default) get
+a pip per combo point count (1-5). Single cast spells (Arcane Shot, Shadow Bolt) get a damage marker on the target's
+health bar, like DoesItDie's. Modeled on the DoesItDie addon next door (`../DoesItDie`), which solves the same
+problems for DoTs. Check there first when unsure how Forever behaves.
 
 ## Forever's restrictions (the reason the code looks the way it does)
 
@@ -30,7 +31,7 @@ the same problems for DoTs. Check there first when unsure how Forever behaves.
 
 ## Files
 
-- `FinishHim.toc`: load order is `Core.lua`, `Meter.lua`, then `Display.lua`. SavedVariables: `FinishHimDB`.
+- `FinishHim.toc`: load order is `Core.lua`, `Meter.lua`, `Display.lua`, then `Options.lua`. SavedVariables: `FinishHimDB`.
 - `Core.lua`: settings, log (`ns.trace`, kept in `db.log`), spell kinds (`KINDS`), the tracked spell list,
   learning (`db.samples[spellName]` ratios, plus per-mob ratios kept for the session), combo points, cast and
   hit events, and the `/fh` commands.
@@ -38,6 +39,12 @@ the same problems for DoTs. Check there first when unsure how Forever behaves.
   spell. Core reports each cast (`ns.meter.recordCast`). After the fight (retries at 1-12s), it computes
   (total - baseline) / sum of tooltip middles / (1 + crit chance) and saves that through `ns.learnRatio`.
   Unverified in-game so far.
+- `Options.lua`: the options window (`/fh` with no arguments, or right-click the pips), plus a page under
+  Options > AddOns that opens it. It's built from plain frames with `BackdropTemplate`, like DoesItDie's. Sliders are
+  a bare `Slider`, not `OptionsSliderTemplate`, so they don't depend on which templates the client still has. All
+  layout happens in `refresh()`, top to bottom. Spell changes go through `ns.addSpell`, `ns.removeSpell` and
+  `ns.moveSpell`; the "Add" list comes from `ns.candidateSpells()`, which scans the spellbook with
+  `C_SpellBook` or the old `GetSpellTabInfo` API. Call `ns.refreshOptions()` after changing the spell list.
 - `Display.lua`: one row per tracked spell, stacked upward above the target frame. Each row has an icon, a big
   skull and one pip per entry. Also dragging, tooltips, and the 0.1s refresh driver. It talks to Core only
   through `ns.*` (`ns.spells`, `ns.kinds`, `ns.estimate`, `ns.comboPoints`, `ns.dotDamage`, `ns.housekeep`).
@@ -54,25 +61,40 @@ the same problems for DoTs. Check there first when unsure how Forever behaves.
   armor doesn't reduce bleeds. Nothing is learned from them, because their hits are ticks. A lit pip on them means
   "dies before the DoT ends".
 
-## Spell kinds (and adding spells without combo points)
+## Spell kinds
 
-`KINDS` in `Core.lua` maps a kind to `{ label, parse, usesPoints, pips }`. `parse(desc)` returns
-`{ [n] = { min, max } }`, one entry per pip. Estimates, learning and the display all work per entry `n`. For
-`usesPoints` kinds, `n` is the number of combo points, and the "now" pip is the current combo points.
-Otherwise it's always entry 1.
+`KINDS` in `Core.lua` maps a kind to `{ label, short, parse, usesPoints, pips }`. `parse(desc)` returns
+`{ [n] = { min, max }, school = mask }`, one entry per pip. Estimates, learning and the display all work per
+entry `n`. For `usesPoints` kinds, `n` is the number of combo points, and the "now" entry is the current combo
+points. Otherwise it's always entry 1. `detectKind` tries the kinds in `KIND_ORDER` (combo before direct, since
+Eviscerate's tooltip also matches the direct parser).
 
-To support direct-damage spells (Sinister Strike, Shadow Bolt, ...), add a kind with `usesPoints = false`,
-`pips = 1`, and a parser that fills only `[1]`. Then handle:
-- `onUnitCombat` only accepts Physical (school 1) hits right now. Non-physical spells need their school checked
-  against the spell instead.
-- Weapon-based tooltips ("weapon damage plus 68") have no fixed range. These need a learned absolute value,
-  not a tooltip ratio.
-- Picking the spell's hit out of white hits by "largest plausible" is weaker for small direct hits.
+- **combo:** `parseComboRanges`, the "1 point: 6-10 damage" table. DoT finishers (Rupture, Rip) are `periodic`.
+- **direct:** `parseDirect`, the first fixed damage clause that isn't followed by "over N sec": "13 Arcane damage",
+  "14 to 23 Fire damage", or "...attack power plus 273 Arcane damage" (the attack power part is learned through
+  the ratio). It reads the school from the word before "damage" (`SCHOOLS`, English and German). It refuses
+  weapon-based tooltips ("weapon damage plus 68"): there's no fixed base, so they'd need a learned absolute
+  value instead of a tooltip ratio. Pure DoTs are left to DoesItDie.
+- Hits are matched to the spell's school in `resolvePending` (when the hit's school is readable).
+- Crits in the damage meter path: the highest of melee, ranged and spell crit chance, counted as double damage.
+  Both choices err careful.
+
+## Health bar markers (Display.lua)
+
+Spells with `marker` on (the default for direct spells; the "Bar" checkbox in options) get a chunk drawn at the
+end of the target's health fill, reaching left. It's a StatusBar as wide as the health bar, pinned with its right
+edge to the health bar's fill texture (`GetStatusBarTexture()`), `SetReverseFill(true)`, max = `UnitHealthMax`,
+value = damage. A clipping frame over the health bar cuts off overkill. Biggest damage first, so smaller chunks
+draw on top. Only Blizzard's target frame health bar is found (`findTargetHealthBar`, same paths as DoesItDie).
+Unverified in-game so far.
 
 ## Working on it
 
-- No Lua interpreter on this machine. To syntax-check, use Python's `luaparser` (`python -m pip install
-  luaparser`, then `luaparser.ast.parse(source)`). Use `python`, not `py`: they're different installs here.
+- No standalone Lua on this machine. Use `python`, not `py`: they're different installs here.
+  - Syntax check: Python's `luaparser` (`luaparser.ast.parse(source)`).
+  - Running Lua: `lupa` embeds real interpreters. Use `from lupa.lua51 import LuaRuntime`; the default is 5.5,
+    which rejects things 5.1 allows, such as assigning to a for-loop variable. Good for testing tooltip patterns:
+    cut the parser functions out of `Core.lua` and call them on sample tooltips.
 - Lua 5.1 rules: no `goto`, no integer division `//`, and a 200-locals-per-scope limit.
 - Testing happens in-game. `/fh probe` prints each tracked spell's tooltip parse and estimates, and the combo point readings. `/fh debug`
   echoes the log to chat. `/fh test` lights everything up. The full log is in

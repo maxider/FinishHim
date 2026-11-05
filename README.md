@@ -1,10 +1,15 @@
 # FinishHim
 
-Shows whether a combo point spell would kill your target right now, for every combo point count. It tracks
-**Eviscerate** by default. Add any other combo point spell with `/fh add <spell>`, for example Ferocious Bite or Rupture.
+Shows whether a spell you pick would kill your target right now. It tracks **Eviscerate** by default. Add
+others in the options window (`/fh`):
 
-Above the target frame there's one row per spell, with its icon on the left and five pips, one per combo point
-count (1-5):
+- **Combo point spells** (Eviscerate, Ferocious Bite, Rupture): a row of five pips, one per combo point count.
+- **Single cast spells** (Arcane Shot, Shadow Bolt, Fireball): a big skull with the damage next to it, plus a
+  marker on the target's health bar.
+
+Spells whose damage depends on your weapon ("weapon damage plus 68") can't be predicted yet.
+
+Above the target frame there's one row per spell, with its icon on the left. For combo point spells:
 
 - **Red with a skull:** the spell with that many points kills the target. The lowest lit pip is the fewest
   points you need, so you don't overkill.
@@ -13,11 +18,18 @@ count (1-5):
 - **Number under each pip:** the estimated damage at that many points. **Grey** means it's still a guess from
   the tooltip (no hit seen yet); **gold** means it's learned from your real hits.
 
+For single cast spells, the big skull lights up when the spell kills, and the number next to it is its damage.
+
+**Health bar marker:** a colored chunk at the end of the target's green health bar shows how much the spell takes
+off. If it covers all the green that's left, the spell kills. Each spell has its own color. Turn a spell's marker
+on or off with its **Bar** checkbox in the options window, or all of them with `/fh markers`.
+
 Hover the row to see the estimates and where they come from.
 
 ## How the estimate works
 
-- It starts from the spell's tooltip (damage per combo point) times 0.75, because the tooltip doesn't include armor.
+- It starts from the spell's tooltip damage times 0.75, because the tooltip doesn't include armor (or, for some
+  spells, attack power).
 - After each fight it reads how much damage the spell did from the game's damage meter, and learns how hard you
   really hit, including armor and attack power. Forever hides single hit amounts from addons, so it learns per
   fight, not per hit.
@@ -33,7 +45,13 @@ trick DoesItDie uses for its kill icon).
 
 ## Commands
 
-`/fh` lists everything. The useful ones:
+`/fh` opens the options window, or right-click the pips. In the window you can:
+
+- add spells: pick one from the list of combo point spells in your spellbook, drag one in, or type its name
+- reorder or remove your tracked spells
+- change every setting below
+
+Every option also has a command. `/fh help` lists them all:
 
 | Command | What it does |
 | --- | --- |

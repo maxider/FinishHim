@@ -68,9 +68,20 @@ local function readTotals()
     return totals
 end
 
+-- The highest of melee, ranged and spell crit chance: the spell's own crit could be any of them, and a higher
+-- one only makes the learned estimate more careful. Crits are counted as double damage (spell crits do 1.5x,
+-- so that errs careful too).
 local function critChance()
-    local ok, crit = pcall(GetCritChance)
-    if ok and type(crit) == "number" and not isSecret(crit) then return crit / 100, string.format("%.1f%%", crit) end
+    local best
+    local function consider(fn, ...)
+        if type(fn) ~= "function" then return end
+        local ok, crit = pcall(fn, ...)
+        if ok and type(crit) == "number" and not isSecret(crit) then best = math.max(best or 0, crit) end
+    end
+    consider(GetCritChance)
+    consider(GetRangedCritChance)
+    for school = 2, 7 do consider(GetSpellCritChance, school) end
+    if best then return best / 100, string.format("%.1f%%", best) end
     return DEFAULT_CRIT, string.format("unreadable, assumed %d%%", DEFAULT_CRIT * 100)
 end
 

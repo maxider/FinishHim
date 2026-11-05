@@ -1,10 +1,11 @@
 ## Interface: 16001
 ## Title: FinishHim
-## Notes: Shows, for each combo point spell you pick (Eviscerate by default), whether casting it would kill your target at each combo point count (/fh).
-## Version: v0.3.0
+## Notes: Shows whether a spell you pick would kill your target: per combo point for finishers like Eviscerate, and as a damage marker on the health bar for single cast spells like Arcane Shot (/fh).
+## Version: v0.5.0
 ## SavedVariables: FinishHimDB
 ## OptionalDeps: DoesItDie
 
 Core.lua
 Meter.lua
 Display.lua
+Options.lua

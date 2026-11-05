@@ -31,6 +31,7 @@ local DEFAULTS = {
     margin = 0,           -- percent taken off every estimate, to be extra careful
     guessFactor = 0.75,   -- tooltip minimum x this, until a real hit has been seen (armor isn't in the tooltip)
     showNumbers = true,
+    showMarkers = true,   -- health bar markers for spells that have them turned on
     includeDots = false,  -- add DoesItDie's remaining DoT damage (dies eventually, not instantly)
     debug = false,
 }
@@ -106,10 +107,8 @@ end
 ---------------------------------------------------------------------------
 -- Spell kinds: how a tooltip turns into damage numbers
 ---------------------------------------------------------------------------
--- Every kind's parser returns { [n] = { min, max } }. Display draws one pip per entry: one per combo point count
--- for "combo". A spell without combo points would be a kind whose parser fills only [1] (one pip, one kill
--- icon); learning, estimates and the display already work per entry, so adding one means a parser here and a
--- line in KINDS. Its hit attribution would need care (see resolvePending), and there's no such kind yet.
+-- Every kind's parser returns { [n] = { min, max }, school = mask }: one entry per combo point count for
+-- "combo", only [1] for "direct" (single cast spells). Estimates, learning and the display all work per entry.
 
 -- "1 point  : 6-11 damage\n 2 points: 12-17 damage ..." (German "1 Punkt: 6-11 Schaden" works too: only the
 -- digits, the colon and the dash are matched). DoT finishers list single numbers: "1 point: 25 damage over 8 secs".
@@ -138,23 +137,76 @@ local function parseComboRanges(desc)
     return count >= 2 and ranges or nil
 end
 
-local KINDS = {
-    combo = { label = "combo point spell", parse = parseComboRanges, usesPoints = true, pips = MAX_POINTS },
+-- School words in tooltips ("13 Arcane damage", German "13 Arkanschaden") -> school mask.
+local SCHOOLS = {
+    physical = 1, holy = 2, fire = 4, nature = 8, frost = 16, shadow = 32, arcane = 64,
+    heilig = 2, feuer = 4, natur = 8, schatten = 32, arkan = 64,
 }
+
+-- Single cast spells: the first fixed damage clause that isn't damage over time.
+--   "An instant shot that causes 13 Arcane damage."              (Arcane Shot)
+--   "Hurls a fiery ball that causes 14 to 23 Fire damage ..."     (Fireball: the DoT part after it is ignored)
+--   "... 15% of your ranged attack power plus 273 Arcane damage"  (the attack power part is learned, not read)
+-- Weapon-based abilities ("weapon damage plus 68") have no fixed number to start from and are refused, and so
+-- are pure DoTs ("40 Shadow damage over 12 sec"): DoesItDie covers those.
+local DIRECT_PATTERNS = {
+    "(%d+)%s+to%s+(%d+)%s+(%a*)%s*[Dd]amage", -- 14 to 23 Fire damage
+    "(%d+)%s*%-%s*(%d+)%s+(%a*)%s*[Dd]amage", -- 14-23 Fire damage
+    "(%d+)%s+bis%s+(%d+)%s+(%a*)[Ss]chaden",  -- 14 bis 23 Feuerschaden
+    "(%d+)()%s+(%a*)%s*[Dd]amage",            -- 13 Arcane damage (the () is a dummy so every pattern has 3 captures)
+    "(%d+)()%s+(%a*)[Ss]chaden",              -- 13 Arkanschaden
+}
+
+local function parseDirect(desc)
+    if not desc or desc:find("[Ww]eapon damage") or desc:find("[Ww]affenschaden") then return nil end
+    local best, bestAt
+    for _, pattern in ipairs(DIRECT_PATTERNS) do
+        local start, finish, low, high, word = desc:find(pattern)
+        -- Skip damage over time: look for the next match of the same pattern after it.
+        while start and (desc:find("^%s*over %d", finish + 1) or desc:find("^%s*über %d", finish + 1)) do
+            start, finish, low, high, word = desc:find(pattern, finish + 1)
+        end
+        if start and (not bestAt or start < bestAt) then
+            if type(high) ~= "string" then high = low end -- the dummy capture is a position
+            best = { min = tonumber(low), max = tonumber(high), word = word }
+            bestAt = start
+        end
+    end
+    if not best or best.min <= 0 then return nil end
+    local school = SCHOOLS[(best.word or ""):lower()] or 1
+    return { [1] = { min = best.min, max = math.max(best.min, best.max) }, school = school }
+end
+
+local KINDS = {
+    combo = { label = "combo point spell", short = "combo points", parse = parseComboRanges, usesPoints = true,
+        pips = MAX_POINTS },
+    direct = { label = "single cast spell", short = "single cast", parse = parseDirect, usesPoints = false, pips = 1 },
+}
+-- Detection order in /fh add: a per-point table wins over a single number in the same tooltip.
+local KIND_ORDER = { "combo", "direct" }
 ns.kinds = KINDS
+
+local function detectKind(desc)
+    for _, id in ipairs(KIND_ORDER) do
+        local ranges = KINDS[id].parse(desc)
+        if ranges then return id, ranges end
+    end
+end
 
 -- Damage over time ("... damage over 12 sec", German "über 12 Sek."): armor doesn't reduce it, its hits are
 -- ticks (nothing to learn from), and a lit pip means "dies by the time it runs out", not "dies now".
-local function isPeriodic(desc)
+local function isPeriodic(desc, kind)
+    if kind ~= "combo" then return false end -- direct parsing already skips DoT clauses
     return desc ~= nil and (desc:find("over %d") ~= nil or desc:find("über %d") ~= nil)
 end
 
 ---------------------------------------------------------------------------
 -- Tracked spells
 ---------------------------------------------------------------------------
--- db.spells is the saved list { { name, kind } } in display order, by name so any rank matches.
--- ns.spells is the same list with what this session knows: { name, kind, spellID (highest known rank or nil),
--- icon, periodic }. Rows of spells the player doesn't know (other class, not learned yet) stay hidden.
+-- db.spells is the saved list { { name, kind, marker } } in display order, by name so any rank matches. marker:
+-- draw the spell's damage on the target's health bar (default on for single cast spells).
+-- ns.spells is the same list with what this session knows: { name, kind, marker, spellID (highest known rank or
+-- nil), icon, periodic, school }. Rows of spells the player doesn't know (other class, not learned yet) stay hidden.
 
 ns.spells = {}
 local spellByName = {}
@@ -181,8 +233,11 @@ local function refreshSpells()
     for _, saved in ipairs(db.spells) do
         if KINDS[saved.kind] then
             local _, icon, spellID = spellInfo(saved.name)
-            local spell = { name = saved.name, kind = saved.kind, spellID = spellID, icon = icon,
-                periodic = isPeriodic(spellDescription(spellID)) }
+            local desc = spellDescription(spellID)
+            local ranges = KINDS[saved.kind].parse(desc)
+            local spell = { name = saved.name, kind = saved.kind, marker = saved.marker and true or false,
+                spellID = spellID, icon = icon, periodic = isPeriodic(desc, saved.kind),
+                school = ranges and ranges.school or 1 }
             table.insert(ns.spells, spell)
             spellByName[saved.name] = spell
         end
@@ -203,15 +258,12 @@ local function addSpell(input)
 
     local desc = spellDescription(spellID)
     if not desc then return false, "Can't read " .. name .. "'s tooltip right now. Try again out of combat." end
-    local kind
-    for kindID, k in pairs(KINDS) do
-        if k.parse(desc) then kind = kindID end
-    end
+    local kind = detectKind(desc)
     if not kind then
-        return false, name .. " has no damage per combo point in its tooltip. Only combo point spells are supported "
-            .. "for now."
+        return false, name .. " has no fixed damage in its tooltip (weapon-based, damage over time, or no damage), "
+            .. "so it can't be predicted."
     end
-    table.insert(db.spells, { name = name, kind = kind })
+    table.insert(db.spells, { name = name, kind = kind, marker = kind == "direct" })
     refreshSpells()
     local spell = spellByName[name]
     return true, string.format("Tracking %s (%s%s).", name, KINDS[kind].label,
@@ -232,6 +284,86 @@ local function removeSpell(input)
     table.remove(db.spells, index)
     refreshSpells()
     return true, "Stopped tracking " .. saved.name .. "."
+end
+
+-- For the options window (Options.lua). addSpell takes a string: a name, an ID as text, or a link.
+ns.addSpell = addSpell
+ns.removeSpell = removeSpell
+
+-- Turns tracked spell `index`'s health bar marker on or off.
+function ns.setMarker(index, on)
+    local saved = db.spells[index]
+    if not saved then return end
+    saved.marker = on and true or false
+    refreshSpells()
+end
+
+-- Moves tracked spell `index` up (-1) or down (+1) in the list (and the display's stacking order).
+function ns.moveSpell(index, delta)
+    local other = index + delta
+    if not db.spells[index] or not db.spells[other] then return end
+    db.spells[index], db.spells[other] = db.spells[other], db.spells[index]
+    refreshSpells()
+end
+
+-- How many saved hits (or fights) the spell's estimate has learned from.
+function ns.learnedCount(spellName)
+    local saved = db.samples[spellName]
+    return saved and #saved or 0
+end
+
+-- Spellbook entries' spell IDs, from whichever spellbook API this client has.
+local function spellbookIDs()
+    local ids = {}
+    if C_SpellBook and C_SpellBook.GetNumSpellBookSkillLines and Enum and Enum.SpellBookSpellBank then
+        local okLines, lines = pcall(C_SpellBook.GetNumSpellBookSkillLines)
+        for line = 1, (okLines and plainNumber(true, lines)) or 0 do
+            local ok, info = pcall(C_SpellBook.GetSpellBookSkillLineInfo, line)
+            if ok and type(info) == "table" and info.itemIndexOffset and info.numSpellBookItems then
+                for i = info.itemIndexOffset + 1, info.itemIndexOffset + info.numSpellBookItems do
+                    local okItem, item = pcall(C_SpellBook.GetSpellBookItemInfo, i, Enum.SpellBookSpellBank.Player)
+                    if okItem and type(item) == "table" and plainNumber(true, item.spellID) and not item.isPassive then
+                        table.insert(ids, item.spellID)
+                    end
+                end
+            end
+        end
+        if #ids > 0 then return ids end
+    end
+    if GetNumSpellTabs and GetSpellTabInfo and GetSpellBookItemInfo then
+        local okTabs, tabs = pcall(GetNumSpellTabs)
+        for tab = 1, (okTabs and plainNumber(true, tabs)) or 0 do
+            local ok, _, _, offset, count = pcall(GetSpellTabInfo, tab)
+            if ok and plainNumber(true, offset) and plainNumber(true, count) then
+                for i = offset + 1, offset + count do
+                    local okItem, itemType, id = pcall(GetSpellBookItemInfo, i, BOOKTYPE_SPELL or "spell")
+                    if okItem and itemType == "SPELL" and plainNumber(true, id) then table.insert(ids, id) end
+                end
+            end
+        end
+    end
+    return ids
+end
+
+-- Spells in the player's spellbook that a kind can read and that aren't tracked yet, for the options window's
+-- "Add" list: { name, icon, spellID, periodic }, by name, one entry per spell (highest rank).
+function ns.candidateSpells()
+    local found, list = {}, {}
+    for _, id in ipairs(spellbookIDs()) do
+        local name = spellName(id)
+        if name and not found[name] and not spellByName[name] then
+            found[name] = true
+            local _, icon, best = spellInfo(name)
+            local desc = spellDescription(best or id)
+            local kind = detectKind(desc)
+            if kind then
+                table.insert(list, { name = name, icon = icon, spellID = best or id, kind = kind,
+                    periodic = isPeriodic(desc, kind) })
+            end
+        end
+    end
+    table.sort(list, function(a, b) return a.name < b.name end)
+    return list
 end
 
 ---------------------------------------------------------------------------
@@ -452,7 +584,7 @@ local function onCastSucceeded(castGUID, spellID)
 end
 
 -- Picks the spell's hit out of what landed around the cast (white hits land too) and learns from it: the
--- largest plausible non-glancing hit. A spell without combo points would need its school checked here too.
+-- largest plausible non-glancing hit of the spell's school.
 local function resolvePending()
     local cast = pendingCast
     pendingCast = nil
@@ -466,6 +598,7 @@ local function resolvePending()
     local best
     for _, hit in ipairs(cast.hits) do
         local plausible = hit.amount >= middle * PLAUSIBLE_MIN and hit.amount <= middle * PLAUSIBLE_MAX
+            and (hit.school == nil or hit.school == cast.spell.school)
         if plausible and hit.flag ~= "GLANCING" and (not best or hit.amount > best.amount) then best = hit end
     end
     if not best then
@@ -506,8 +639,7 @@ local function onUnitCombat(unit, action, flag, amount, school)
         if hidden then pendingCast.hidden, hitStats.hidden = pendingCast.hidden + 1, hitStats.hidden + 1 end
     end
     if hidden then return end
-    -- Combo point spells are Physical (Eviscerate, Ferocious Bite).
-    if not isSecret(school) and type(school) == "number" and school ~= 1 then return end
+    local plainSchool = (not isSecret(school) and type(school) == "number") and school or nil
     local plainFlag = (not isSecret(flag)) and flag or ""
 
     -- The same hit fires for target, nameplateN, softenemy...: take it once per frame.
@@ -516,7 +648,7 @@ local function onUnitCombat(unit, action, flag, amount, school)
     if frameHits[signature] then return end
     frameHits[signature] = true
 
-    local hit = { key = key, amount = amount, flag = plainFlag, at = now }
+    local hit = { key = key, amount = amount, flag = plainFlag, school = plainSchool, at = now }
     table.insert(recentHits, hit)
     while recentHits[1] and now - recentHits[1].at > HIT_LOOKBACK do table.remove(recentHits, 1) end
     if pendingCast and pendingCast.key == key then table.insert(pendingCast.hits, hit) end
@@ -587,6 +719,7 @@ frame:SetScript("OnEvent", function(self, event, ...)
         if not loggedIn then return end
         refreshSpells() -- new ranks, spells learned
         ns.display.setup()
+        ns.refreshOptions()
     elseif not loggedIn then
         return
     elseif event == "PLAYER_TARGET_CHANGED" then
@@ -618,7 +751,8 @@ end)
 local function onOff(v) return v and "|cff66ff66on|r" or "|cffff6666off|r" end
 
 local HELP = {
-    "/fh add <spell> - track a combo point spell (name, or shift-click it from your spellbook)",
+    "/fh - open the options window (or right-click the pips)",
+    "/fh add <spell> - track a spell: combo point or single cast (name, or shift-click it from your spellbook)",
     "/fh remove <spell or number> - stop tracking a spell",
     "/fh list - show the tracked spells",
     "/fh lock | unlock - lock the pips, or unlock to drag them",
@@ -627,6 +761,7 @@ local HELP = {
     "/fh margin <0-50> - take this % off every estimate (extra careful)",
     "/fh guess <0.3-1.5> - tooltip multiplier used until a real hit is seen (default 0.75)",
     "/fh numbers - show/hide the damage under each pip",
+    "/fh markers - show/hide the damage markers on the target's health bar",
     "/fh dots - also count DoesItDie's remaining DoT damage (dies eventually, not instantly)",
     "/fh test - light everything up for 10 seconds",
     "/fh probe - print tooltips, combo point readings and estimates",
@@ -667,10 +802,15 @@ SlashCmdList.FINISHHIM = function(msg)
     local cmd, arg = strtrim(msg or ""):match("^(%S*)%s*(.-)$")
     cmd = cmd:lower()
     local number = tonumber(arg)
-    if cmd == "add" or cmd == "remove" then
+    if cmd == "" or cmd == "options" or cmd == "config" then
+        ns.openOptions()
+    elseif cmd == "add" or cmd == "remove" then
         local ok, message = (cmd == "add" and addSpell or removeSpell)(arg)
         print(message)
-        if ok then ns.display.setup() end
+        if ok then
+            ns.display.setup()
+            ns.refreshOptions()
+        end
     elseif cmd == "list" then
         if #db.spells == 0 then print("No spells tracked (/fh add <spell>).") end
         for i, saved in ipairs(db.spells) do
@@ -699,6 +839,10 @@ SlashCmdList.FINISHHIM = function(msg)
         db.showNumbers = not db.showNumbers
         ns.display.setup()
         print("Damage numbers " .. onOff(db.showNumbers))
+    elseif cmd == "markers" then
+        db.showMarkers = not db.showMarkers
+        ns.display.setup()
+        print("Health bar markers " .. onOff(db.showMarkers))
     elseif cmd == "dots" then
         db.includeDots = not db.includeDots
         print("Counting DoesItDie's DoT damage " .. onOff(db.includeDots)

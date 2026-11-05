@@ -1,5 +1,6 @@
 -- FinishHim display: one row per tracked spell, stacked above the target frame (the first spell sits lowest).
--- A row is the spell's icon, a big skull, and one pip per entry: for combo point spells, one per point count.
+-- A row is the spell's icon, a big skull, and for combo point spells one pip per point count (single cast spells
+-- show their damage number instead of pips).
 -- Pip N lights up (red, with a skull) when the spell with N points would kill the target, so the lowest lit pip
 -- is the fewest points you need. The pip for your current points has a gold border, and the big skull lights up
 -- when the spell kills right now. Spells the player doesn't know have no row.
@@ -85,9 +86,15 @@ local function showTooltip(row)
         GameTooltip:AddLine("Damage over time: lit means it dies before the DoT runs out, not instantly.",
             1, 0.82, 0, true)
     else
-        GameTooltip:AddLine("Lowest normal hit, no crit. A dodge or parry still saves it.", 0.7, 0.7, 0.7, true)
+        GameTooltip:AddLine("Lowest normal hit, no crit. A miss, dodge, parry or resist still saves it.",
+            0.7, 0.7, 0.7, true)
+    end
+    if spell.marker and ns.db.showMarkers then
+        GameTooltip:AddLine("Its damage is marked on the target's health bar: if the marker covers all the health "
+            .. "that's left, it dies.", 0.7, 0.7, 0.7, true)
     end
     if not ns.db.locked then GameTooltip:AddLine("Unlocked: drag to move, /fh lock when done.", 0.4, 1, 0.4) end
+    GameTooltip:AddLine("Right-click: options", 0.4, 0.8, 1)
     GameTooltip:Show()
 end
 
@@ -105,6 +112,9 @@ local function createRow()
         ns.db.point = { point, relativePoint, x, y }
     end)
     row:SetScript("OnEnter", showTooltip)
+    row:SetScript("OnMouseUp", function(_, button)
+        if button == "RightButton" then ns.openOptions() end
+    end)
     row:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
     local bigBack = row:CreateTexture(nil, "BACKGROUND")
@@ -114,6 +124,10 @@ local function createRow()
     local bigWindow, bigBar, bigSkull = killWindow(row, BIG)
     bigWindow:SetAllPoints(bigBack)
     bigSkull:SetTexture(SKULL)
+
+    -- Single cast spells: their damage, next to the big skull.
+    local bigDamage = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    bigDamage:SetPoint("LEFT", bigBack, "RIGHT", GAP * 2, 0)
 
     local icon = row:CreateTexture(nil, "ARTWORK")
     icon:SetSize(ICON, ICON)
@@ -155,16 +169,131 @@ local function createRow()
         pips[i] = { frame = pip, border = border, bar = bar, damage = damage }
     end
 
-    return { frame = row, icon = icon, bigWindow = bigWindow, bigBar = bigBar, pips = pips }
+    return { frame = row, icon = icon, bigWindow = bigWindow, bigBar = bigBar, bigDamage = bigDamage, pips = pips }
 end
 
--- Fits a row to its spell: icon, and how many pips its kind has.
+-- Fits a row to its spell: icon, and pips for combo point spells or the damage number for single cast ones.
 local function assign(row, spell)
     row.spell = spell
     row.frame.spell = spell -- for the tooltip
     row.icon:SetTexture(spell.icon or QUESTION)
-    local count = ns.kinds[spell.kind].pips
+    local kind = ns.kinds[spell.kind]
+    local count = kind.usesPoints and kind.pips or 0
     for i, pip in ipairs(row.pips) do pip.frame:SetShown(i <= count) end
+    row.bigDamage:SetShown(not kind.usesPoints and ns.db.showNumbers)
+end
+
+---------------------------------------------------------------------------
+-- Health bar markers
+---------------------------------------------------------------------------
+-- For each spell with its marker on: the chunk of the target's health the spell would take, drawn at the end of
+-- the health fill and reaching left. If it covers all the health that's left, the spell kills.
+-- Health is secret, so the chunk is a StatusBar: as wide as the health bar, its right edge pinned to the
+-- health fill's right edge, filling right to left, with max = max health and value = damage. Its fill is then
+-- exactly the damage on the health bar's scale. A clipping frame over the health bar cuts off whatever reaches
+-- past the bar's left edge (overkill).
+
+local MARKER_COLORS = { { 0.25, 0.8, 1 }, { 1, 0.6, 0.15 }, { 0.8, 0.45, 1 }, { 0.35, 1, 0.45 } }
+local markerClip = CreateFrame("Frame", "FinishHimMarkers", UIParent)
+markerClip:SetClipsChildren(true)
+markerClip:Hide()
+local markers = {}
+local markerHost, markerHostFill -- the target frame's health bar and its fill texture
+
+local function findTargetHealthBar()
+    local tf = TargetFrame
+    local main = tf and tf.TargetFrameContent and tf.TargetFrameContent.TargetFrameContentMain
+    return (main and main.HealthBarsContainer and main.HealthBarsContainer.HealthBar)
+        or (main and main.HealthBar)
+        or TargetFrameHealthBar
+        or (tf and tf.healthbar)
+end
+
+local function createMarker()
+    local bar = CreateFrame("StatusBar", nil, markerClip)
+    bar:SetStatusBarTexture(WHITE)
+    bar:SetStatusBarColor(0, 0, 0, 0)
+    if bar.SetReverseFill then bar:SetReverseFill(true) end
+    bar:SetMinMaxValues(0, 1)
+    bar:SetValue(0)
+    local span = bar:GetStatusBarTexture()
+    local fill = bar:CreateTexture(nil, "ARTWORK")
+    fill:SetAllPoints(span)
+    local edges = {}
+    local function edge(point1, point2, horizontal)
+        local texture = bar:CreateTexture(nil, "OVERLAY")
+        texture:SetPoint(point1, span, point1)
+        texture:SetPoint(point2, span, point2)
+        if horizontal then texture:SetHeight(1) else texture:SetWidth(1) end
+        table.insert(edges, texture)
+    end
+    edge("TOPLEFT", "TOPRIGHT", true)
+    edge("BOTTOMLEFT", "BOTTOMRIGHT", true)
+    edge("TOPLEFT", "BOTTOMLEFT", false)
+    edge("TOPRIGHT", "BOTTOMRIGHT", false)
+    return { bar = bar, fill = fill, edges = edges, width = nil }
+end
+
+-- Attaches the markers to the target frame's health bar. False if there's none (or it's hidden).
+local function attachMarkers()
+    local bar = findTargetHealthBar()
+    if bar ~= markerHost then
+        markerHost, markerHostFill = bar, nil
+        if bar then
+            local ok, fill = pcall(bar.GetStatusBarTexture, bar)
+            markerHostFill = ok and fill or nil
+            markerClip:ClearAllPoints()
+            markerClip:SetAllPoints(bar)
+            pcall(function()
+                markerClip:SetFrameStrata(bar:GetFrameStrata())
+                markerClip:SetFrameLevel(bar:GetFrameLevel() + 5)
+            end)
+            for _, marker in ipairs(markers) do marker.width = nil end
+        end
+    end
+    if not (markerHost and markerHostFill) then return false end
+    local ok, visible = pcall(markerHost.IsVisible, markerHost)
+    return ok and not ns.isSecret(visible) and visible
+end
+
+local function hideMarkers()
+    markerClip:Hide()
+end
+
+-- entries: { damage, colorIndex } of the spells to mark. Needs a pcall around it (max health is secret).
+local function updateMarkers(entries)
+    if not ns.db.showMarkers or #entries == 0 or not attachMarkers() then return hideMarkers() end
+    local okWidth, width = pcall(markerHost.GetWidth, markerHost)
+    if not okWidth or ns.isSecret(width) or type(width) ~= "number" or width <= 0 then width = 120 end
+    -- Biggest first, so smaller chunks draw on top of it and stay visible.
+    table.sort(entries, function(a, b) return a.damage > b.damage end)
+    local maxHealth = UnitHealthMax("target")
+    local level = markerClip:GetFrameLevel()
+    for i, entry in ipairs(entries) do
+        local marker = markers[i] or createMarker()
+        markers[i] = marker
+        if marker.width ~= width then
+            marker.width = width
+            marker.bar:ClearAllPoints()
+            marker.bar:SetPoint("TOPRIGHT", markerHostFill, "TOPRIGHT")
+            marker.bar:SetPoint("BOTTOMRIGHT", markerHostFill, "BOTTOMRIGHT")
+            marker.bar:SetWidth(width)
+        end
+        local color = MARKER_COLORS[(entry.colorIndex - 1) % #MARKER_COLORS + 1]
+        marker.fill:SetColorTexture(color[1], color[2], color[3], 0.35)
+        for _, edge in ipairs(marker.edges) do edge:SetColorTexture(color[1], color[2], color[3], 0.95) end
+        marker.bar:SetFrameLevel(level + i)
+        marker.bar:SetMinMaxValues(0, maxHealth)
+        marker.bar:SetValue(entry.damage)
+        marker.bar:Show()
+    end
+    for i = #entries + 1, #markers do markers[i].bar:Hide() end
+    markerClip:Show()
+end
+
+-- The color a spell's marker gets: by its place in the tracked list, so it stays put while others come and go.
+function display.markerColor(index)
+    return MARKER_COLORS[(index - 1) % #MARKER_COLORS + 1]
 end
 
 ---------------------------------------------------------------------------
@@ -189,6 +318,7 @@ function display.setup()
         rows[i] = rows[i] or createRow()
         assign(rows[i], spell)
         for _, pip in ipairs(rows[i].pips) do pip.damage:SetShown(db.showNumbers) end
+        rows[i].colorIndex = i
     end
     for i = #ns.spells + 1, #rows do
         rows[i].spell, rows[i].frame.spell = nil, nil
@@ -252,6 +382,8 @@ local function showTest()
             end
             row.bigBar:SetMinMaxValues(0, 1)
             row.bigBar:SetValue(1)
+            row.bigDamage:SetText(250)
+            row.bigDamage:SetTextColor(LEARNED_COLOR[1], LEARNED_COLOR[2], LEARNED_COLOR[3])
         end
     end
     layout(shown)
@@ -299,6 +431,8 @@ local function update()
                 pip.frame:SetAlpha(estimates[i] and 1 or 0.4)
                 setBorder(pip, ns.kinds[spell.kind].usesPoints and i == current)
             end
+            row.bigDamage:SetText(estimates[1] or "?")
+            row.bigDamage:SetTextColor(color[1], color[2], color[3])
             -- Counted points may be off by one: the big skull is dimmer then.
             local sure = source == "read" or not ns.kinds[spell.kind].usesPoints
             row.bigWindow:SetAlpha(sure and 1 or 0.6)
@@ -309,6 +443,7 @@ local function update()
         return
     end
 
+    local marked = {}
     local ok, err = pcall(function()
         local health = UnitHealth("target")
         for _, index in ipairs(shown) do
@@ -320,7 +455,11 @@ local function update()
             local now = n.nowEntry >= 1 and n.estimates[n.nowEntry]
             row.bigBar:SetMinMaxValues(0, health)
             row.bigBar:SetValue(now and (now + dots) or 0)
+            if row.spell.marker and now and now > 0 then
+                table.insert(marked, { damage = now, colorIndex = row.colorIndex or index })
+            end
         end
+        updateMarkers(marked)
     end)
     if not ok then
         if not reportedError then
@@ -339,6 +478,7 @@ function display.refresh()
     if not ns.db then return end
     ns.housekeep(GetTime())
     local ok, err = pcall(update)
+    if not ok or not container:IsShown() then hideMarkers() end
     if not ok and not reportedError then
         reportedError = true
         ns.print("Display error: " .. tostring(err))
