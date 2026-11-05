@@ -1,9 +1,10 @@
 ## Interface: 16001
 ## Title: FinishHim
-## Notes: Shows, for every combo point count, whether Eviscerate would kill your target right now, so you know when to finish and how few points you need (/fh).
-## Version: v0.1.0
+## Notes: Shows, for each combo point spell you pick (Eviscerate by default), whether casting it would kill your target at each combo point count (/fh).
+## Version: v0.3.0
 ## SavedVariables: FinishHimDB
 ## OptionalDeps: DoesItDie
 
 Core.lua
+Meter.lua
 Display.lua

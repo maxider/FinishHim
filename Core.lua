@@ -1,32 +1,23 @@
--- FinishHim core: how much damage Eviscerate will do at each combo point count, and how many points you have.
+-- FinishHim core: how much damage each spell you picked will do, and how many combo points you have.
 --
 -- In WoW: Forever the target's health is secret, so Lua can never compare "damage vs health" itself. What stays
 -- readable (same findings as DoesItDie):
---   * our own casts (UNIT_SPELLCAST_SENT/SUCCEEDED) and spell descriptions -> Eviscerate's damage per combo point
---   * UNIT_COMBAT damage amounts on the target -> what Eviscerate really hit for (armor, attack power included)
+--   * our own casts (UNIT_SPELLCAST_SENT/SUCCEEDED) and spell descriptions -> a spell's damage numbers
+--   * UNIT_COMBAT damage amounts on the target -> what the spell really hit for (armor, attack power included)
 -- The comparison with health is done by StatusBars in Display.lua.
 --
--- The estimate is the LOWEST roll of a normal (non-crit) hit, so a lit pip means "this kills even on a bad roll".
+-- Estimates are the LOWEST roll of a normal (non-crit) hit, so a lit pip means "this kills even on a bad roll".
 
 local ADDON_NAME, ns = ...
 
 local MAX_LOG = 400
 local MAX_POINTS = 5
-local SAMPLES_KEPT = 20             -- learned hits kept per finisher (saved)
+local SAMPLES_KEPT = 20             -- learned hits kept per spell (saved)
 local HIT_WINDOW = 0.5              -- seconds after the cast in which its hit must arrive
 local HIT_LOOKBACK = 0.25           -- the hit can also arrive just before the cast event
 local AVOID_WINDOW = 0.4            -- a dodge/parry/miss this soon after a builder takes its points back
-local PLAUSIBLE_MIN, PLAUSIBLE_MAX = 0.3, 3 -- a hit this far off the tooltip's numbers isn't Eviscerate
-
--- Finishers this addon predicts, by every rank's spell ID (works on any client language).
--- Eviscerate ranks 1-8 (Classic), 9-10 (TBC). The highest rank the player knows is the one predicted.
-local FINISHERS = {
-    { key = "Eviscerate", ranks = { 2098, 6760, 6761, 6762, 8623, 8624, 11299, 11300, 31016, 26865 } },
-}
-local FINISHER_BY_ID = {}
-for _, finisher in ipairs(FINISHERS) do
-    for _, id in ipairs(finisher.ranks) do FINISHER_BY_ID[id] = finisher end
-end
+local PLAUSIBLE_MIN, PLAUSIBLE_MAX = 0.3, 3 -- a hit this far off the tooltip's numbers isn't the spell's
+local EVISCERATE_ID = 2098          -- tracked by default (any rank; the name comes from the client's language)
 
 local AVOIDED = {
     MISS = true, DODGE = true, PARRY = true, EVADE = true, IMMUNE = true, DEFLECT = true, RESIST = true, REFLECT = true,
@@ -45,7 +36,6 @@ local DEFAULTS = {
 }
 
 local db
-ns.finishers = FINISHERS
 
 ---------------------------------------------------------------------------
 -- Helpers
@@ -60,6 +50,10 @@ ns.isSecret = isSecret
 
 local function plainNumber(ok, v)
     if ok and type(v) == "number" and not isSecret(v) then return v end
+end
+
+local function plainString(ok, v)
+    if ok and type(v) == "string" and not isSecret(v) and v ~= "" then return v end
 end
 
 local function print(msg)
@@ -83,30 +77,43 @@ local function unitKey(unit)
 end
 ns.unitKey = unitKey
 
-local function spellDescription(spellID)
-    local fn = (C_Spell and C_Spell.GetSpellDescription) or GetSpellDescription
-    if not fn then return nil end
-    local ok, desc = pcall(fn, spellID)
-    if ok and type(desc) == "string" and not isSecret(desc) and desc ~= "" then return desc end
+local function spellName(spellID)
+    if C_Spell and C_Spell.GetSpellName then return plainString(pcall(C_Spell.GetSpellName, spellID)) end
+    if GetSpellInfo then return plainString(pcall(GetSpellInfo, spellID)) end
 end
 
-local function knows(spellID)
-    for _, fn in ipairs({ IsPlayerSpell, IsSpellKnown }) do
-        if type(fn) == "function" then
-            local ok, known = pcall(fn, spellID)
-            if ok and not isSecret(known) and known then return true end
+-- Name, icon and spell ID of a spell in the player's spellbook, by name or ID. Looked up by name, Classic
+-- clients give the highest rank the player knows, which is the one to predict. nil if the player doesn't know it.
+local function spellInfo(nameOrID)
+    if C_Spell and C_Spell.GetSpellInfo then
+        local ok, info = pcall(C_Spell.GetSpellInfo, nameOrID)
+        if ok and type(info) == "table" and plainNumber(true, info.spellID) then
+            return plainString(true, info.name), info.iconID, info.spellID
         end
     end
-    return false
+    if GetSpellInfo then
+        local ok, name, _, icon, _, _, _, id = pcall(GetSpellInfo, nameOrID)
+        if ok and plainString(true, name) and plainNumber(true, id) then return name, icon, id end
+    end
+end
+
+local function spellDescription(spellID)
+    local fn = (C_Spell and C_Spell.GetSpellDescription) or GetSpellDescription
+    if not fn or not spellID then return nil end
+    return plainString(pcall(fn, spellID))
 end
 
 ---------------------------------------------------------------------------
--- Tooltip: damage range per combo point
+-- Spell kinds: how a tooltip turns into damage numbers
 ---------------------------------------------------------------------------
+-- Every kind's parser returns { [n] = { min, max } }. Display draws one pip per entry: one per combo point count
+-- for "combo". A spell without combo points would be a kind whose parser fills only [1] (one pip, one kill
+-- icon); learning, estimates and the display already work per entry, so adding one means a parser here and a
+-- line in KINDS. Its hit attribution would need care (see resolvePending), and there's no such kind yet.
 
 -- "1 point  : 6-11 damage\n 2 points: 12-17 damage ..." (German "1 Punkt: 6-11 Schaden" works too: only the
--- digits, the colon and the dash are matched). Returns { [points] = { min, max } } or nil.
-local function parseRanges(desc)
+-- digits, the colon and the dash are matched). DoT finishers list single numbers: "1 point: 25 damage over 8 secs".
+local function parseComboRanges(desc)
     if not desc then return nil end
     local ranges, found = {}, false
     for points, low, high in desc:gmatch("(%d+)[^%d\n:]-:%s*(%d+)%s*%-%s*(%d+)") do
@@ -116,7 +123,7 @@ local function parseRanges(desc)
             found = true
         end
     end
-    if not found then -- single numbers: "1 point: 10 damage"
+    if not found then
         for points, amount in desc:gmatch("(%d+)[^%d\n:]-:%s*(%d+)") do
             points = tonumber(points)
             if points >= 1 and points <= MAX_POINTS and not ranges[points] then
@@ -125,51 +132,117 @@ local function parseRanges(desc)
             end
         end
     end
-    return found and ranges or nil
+    -- Two entries at least: a lone "1: 20" is more likely a stray number than a per-point table.
+    local count = 0
+    for _ in pairs(ranges) do count = count + 1 end
+    return count >= 2 and ranges or nil
 end
-ns.parseRanges = parseRanges
+
+local KINDS = {
+    combo = { label = "combo point spell", parse = parseComboRanges, usesPoints = true, pips = MAX_POINTS },
+}
+ns.kinds = KINDS
+
+-- Damage over time ("... damage over 12 sec", German "über 12 Sek."): armor doesn't reduce it, its hits are
+-- ticks (nothing to learn from), and a lit pip means "dies by the time it runs out", not "dies now".
+local function isPeriodic(desc)
+    return desc ~= nil and (desc:find("over %d") ~= nil or desc:find("über %d") ~= nil)
+end
+
+---------------------------------------------------------------------------
+-- Tracked spells
+---------------------------------------------------------------------------
+-- db.spells is the saved list { { name, kind } } in display order, by name so any rank matches.
+-- ns.spells is the same list with what this session knows: { name, kind, spellID (highest known rank or nil),
+-- icon, periodic }. Rows of spells the player doesn't know (other class, not learned yet) stay hidden.
+
+ns.spells = {}
+local spellByName = {}
 
 local rangeCache = {} -- spellID -> { ranges, at }
 local RANGE_CACHE_SECONDS = 2 -- descriptions can change with attack power
 
-local function rangesFor(spellID)
+local function rangesFor(spell)
+    local spellID = spell.spellID
     if not spellID then return nil end
     local cached = rangeCache[spellID]
     local now = GetTime()
     if cached and now - cached.at < RANGE_CACHE_SECONDS then return cached.ranges end
-    local ranges = parseRanges(spellDescription(spellID))
+    local ranges = KINDS[spell.kind].parse(spellDescription(spellID))
     -- Descriptions can be unreadable in combat: keep the last good parse rather than losing the estimate.
     if not ranges and cached then ranges = cached.ranges end
     rangeCache[spellID] = { ranges = ranges, at = now }
     return ranges
 end
 
-local activeRank = {} -- finisher key -> highest known rank's spell ID
-
-local function updateKnownRanks()
-    for _, finisher in ipairs(FINISHERS) do
-        local best
-        for _, id in ipairs(finisher.ranks) do
-            if knows(id) then best = id end
+local function refreshSpells()
+    wipe(ns.spells)
+    wipe(spellByName)
+    for _, saved in ipairs(db.spells) do
+        if KINDS[saved.kind] then
+            local _, icon, spellID = spellInfo(saved.name)
+            local spell = { name = saved.name, kind = saved.kind, spellID = spellID, icon = icon,
+                periodic = isPeriodic(spellDescription(spellID)) }
+            table.insert(ns.spells, spell)
+            spellByName[saved.name] = spell
         end
-        activeRank[finisher.key] = best
     end
 end
-ns.updateKnownRanks = updateKnownRanks
+ns.refreshSpells = refreshSpells
 
-function ns.activeRank(finisher)
-    return activeRank[finisher.key]
+-- "Eviscerate", "11300", or a shift-clicked spell link. Returns true and a message, or false and why not.
+local function addSpell(input)
+    local id = tonumber(input:match("|Hspell:(%d+)") or input:match("^(%d+)$"))
+    local lookup = id or strtrim((input:gsub("[%[%]]", "")))
+    if lookup == "" then return false, "Which spell? /fh add Eviscerate (or shift-click it from your spellbook)" end
+    local found = spellInfo(lookup) or (id and spellName(id))
+    if not found then return false, "Couldn't find '" .. tostring(lookup) .. "'. Is it in your spellbook?" end
+    local name, _, spellID = spellInfo(found) -- the highest rank of it the player knows
+    if not spellID then return false, found .. " isn't in your spellbook." end
+    if spellByName[name] then return false, name .. " is already tracked." end
+
+    local desc = spellDescription(spellID)
+    if not desc then return false, "Can't read " .. name .. "'s tooltip right now. Try again out of combat." end
+    local kind
+    for kindID, k in pairs(KINDS) do
+        if k.parse(desc) then kind = kindID end
+    end
+    if not kind then
+        return false, name .. " has no damage per combo point in its tooltip. Only combo point spells are supported "
+            .. "for now."
+    end
+    table.insert(db.spells, { name = name, kind = kind })
+    refreshSpells()
+    local spell = spellByName[name]
+    return true, string.format("Tracking %s (%s%s).", name, KINDS[kind].label,
+        spell.periodic and ", damage over time: lit means it dies before the DoT runs out" or "")
+end
+
+local function removeSpell(input)
+    local index = tonumber(input)
+    if not index then
+        local wanted = strtrim((input:gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|H.-|h", ""):gsub("|[hr]", "")
+            :gsub("[%[%]]", ""))):lower()
+        for i, saved in ipairs(db.spells) do
+            if saved.name:lower() == wanted then index = i end
+        end
+    end
+    local saved = index and db.spells[index]
+    if not saved then return false, "Not tracked: " .. input .. " (/fh list shows what is)" end
+    table.remove(db.spells, index)
+    refreshSpells()
+    return true, "Stopped tracking " .. saved.name .. "."
 end
 
 ---------------------------------------------------------------------------
--- Learning: what Eviscerate really hits for, relative to its tooltip
+-- Learning: what a spell really hits for, relative to its tooltip
 ---------------------------------------------------------------------------
--- Each landed non-crit hit gives ratio = amount / tooltip middle at that combo point count. The ratio carries
--- armor and any attack power the tooltip leaves out, and works for every point count, so one 3-point hit
--- also improves the 5-point estimate. On a mob already hit this session, that mob's ratios are used; otherwise
--- a cautious pick (low quartile) of the saved ones, since other mobs may have more armor.
+-- Each landed non-crit hit gives ratio = amount / tooltip middle for that entry (combo point count). The ratio
+-- carries armor and any attack power the tooltip leaves out, and works for every entry, so a 3-point hit also
+-- improves the 5-point estimate. On a mob already hit this session, that mob's ratios are used; otherwise a
+-- cautious pick (low quartile) of the saved ones, since other mobs may have more armor.
 
-local mobSamples = {} -- unit key -> { ratio, ... } (this session only)
+local mobSamples = {} -- unit key -> spell name -> { ratio, ... } (this session only)
 
 local function mean(list)
     local sum = 0
@@ -184,51 +257,57 @@ local function lowQuartile(list)
     return sorted[math.floor(#sorted * 0.25) + 1]
 end
 
--- Returns ratio and a description of where it came from.
-local function ratioFor(finisher, key)
-    local onMob = key and mobSamples[key] and mobSamples[key][finisher.key]
+-- Returns ratio, a description of where it came from, and true when it's only the guess (no hit seen yet).
+local function ratioFor(spell, key)
+    if spell.periodic then return 1, "tooltip total (damage over time, armor doesn't reduce it)" end
+    local onMob = key and mobSamples[key] and mobSamples[key][spell.name]
     if onMob and #onMob > 0 then
         return mean(onMob), string.format("learned on this mob (%d hit%s)", #onMob, #onMob == 1 and "" or "s")
     end
-    local saved = db.samples[finisher.key]
+    local saved = db.samples[spell.name]
     if saved and #saved > 0 then
         return lowQuartile(saved), string.format("learned (%d hit%s)", #saved, #saved == 1 and "" or "s")
     end
-    return db.guessFactor, string.format("guess: tooltip x %.2f (no hit seen yet)", db.guessFactor)
+    return db.guessFactor, string.format("guess: tooltip x %.2f (no hit seen yet)", db.guessFactor), true
 end
 
-local function learn(finisher, key, ratio, points, amount)
-    local saved = db.samples[finisher.key] or {}
-    db.samples[finisher.key] = saved
+-- Saves one ratio for `spell` (and for the mob behind `key`, if given). `note` says what it was learned from.
+-- Used by the hit path below and by Meter.lua (the game's damage meter, after a fight).
+local function learnRatio(spell, key, ratio, note)
+    local saved = db.samples[spell.name] or {}
+    db.samples[spell.name] = saved
     table.insert(saved, ratio)
     while #saved > SAMPLES_KEPT do table.remove(saved, 1) end
     if key then
         mobSamples[key] = mobSamples[key] or {}
-        local onMob = mobSamples[key][finisher.key] or {}
-        mobSamples[key][finisher.key] = onMob
+        local onMob = mobSamples[key][spell.name] or {}
+        mobSamples[key][spell.name] = onMob
         table.insert(onMob, ratio)
     end
-    trace(string.format("LEARN %s %d points hit %d (ratio %.3f to tooltip middle)", finisher.key, points, amount, ratio))
+    trace(string.format("LEARN %s: %s (ratio %.3f to tooltip middle)", spell.name, note, ratio))
 end
+ns.learnRatio = learnRatio
 
 function ns.forget()
     wipe(db.samples)
     wipe(mobSamples)
 end
 
--- Lowest normal hit of `finisher` at `points` on the target, plus a source description. nil if unknown.
-function ns.estimate(finisher, points)
-    local ranges = rangesFor(activeRank[finisher.key])
-    local range = ranges and ranges[points]
+-- Lowest normal hit of `spell` at entry `n` (combo points) on the target, a source description, and true when
+-- it's only guessed from the tooltip (Display greys those). nil if unknown.
+function ns.estimate(spell, n)
+    local ranges = rangesFor(spell)
+    local range = ranges and ranges[n]
     if not range then return nil end
-    local ratio, source = ratioFor(finisher, unitKey("target"))
+    local ratio, source, guessed = ratioFor(spell, unitKey("target"))
     local damage = range.min * ratio * (1 - db.margin / 100)
-    return math.max(0, math.floor(damage)), source
+    return math.max(0, math.floor(damage)), source, guessed or false
 end
 
-function ns.tooltipRanges(finisher)
-    return rangesFor(activeRank[finisher.key])
+function ns.tooltipRanges(spell)
+    return rangesFor(spell)
 end
+ns.rangesFor = rangesFor
 
 -- Remaining DoT damage on the target from DoesItDie, if that addon is loaded and the option is on.
 function ns.dotDamage()
@@ -308,10 +387,18 @@ end
 -- Casts and hits
 ---------------------------------------------------------------------------
 
-local sentKeys = {}       -- castGUID -> { key, points, at }: the target and combo points when the cast was sent
-local pendingCast         -- { finisher, rank, points, key, at, hits }: Eviscerate waiting for its hit
+local sentKeys = {}       -- castGUID -> { key, points, at }: the target (and combo points) when the cast was sent
+local pendingCast         -- { spell, entry, key, at, hits, seen, hidden, record }: a tracked cast waiting for its hit
+-- Hits on targets while a cast waited: how many, and how many had a hidden (secret) amount. For /fh probe.
+local hitStats = { seen = 0, hidden = 0 }
 local recentHits = {}     -- { key, amount, flag, at }: last fraction of a second of hits, for the look-back
 local frameHitsAt, frameHits = nil, {}
+
+local function trackedSpell(spellID)
+    local name = spellName(spellID)
+    return name and spellByName[name]
+end
+ns.trackedSpell = trackedSpell
 
 local function onCastSent(castGUID, spellID)
     if isSecret(castGUID) or isSecret(spellID) or not castGUID then return end
@@ -319,10 +406,10 @@ local function onCastSent(castGUID, spellID)
     for guid, sent in pairs(sentKeys) do
         if now - sent.at > 10 then sentKeys[guid] = nil end
     end
+    local spell = trackedSpell(spellID)
     local points
-    if FINISHER_BY_ID[spellID] then
-        local read = readComboPoints()
-        points = read or (counted > 0 and counted) or nil
+    if spell and KINDS[spell.kind].usesPoints then
+        points = readComboPoints() or (counted > 0 and counted) or nil -- spent by the time the cast succeeds
     end
     sentKeys[castGUID] = { key = unitKey("target"), points = points, at = now }
 end
@@ -333,17 +420,20 @@ local function onCastSucceeded(castGUID, spellID)
     local sent = (castGUID and not isSecret(castGUID)) and sentKeys[castGUID]
     if sent then sentKeys[castGUID] = nil end
     local key = sent and sent.key or unitKey("target")
-
-    local finisher = FINISHER_BY_ID[spellID]
     local desc = spellDescription(spellID)
-    if finisher then
-        local points = sent and sent.points
-        resetCount()
-        trace(string.format("CAST %s (id %d) with %s combo points on %s", finisher.key, spellID,
-            tostring(points or "?"), tostring(key)))
-        if points and points > 0 and key then
-            pendingCast = { finisher = finisher, rank = spellID, points = math.min(points, MAX_POINTS), key = key,
-                at = now, hits = {} }
+
+    local spell = trackedSpell(spellID)
+    if spell then
+        local usesPoints = KINDS[spell.kind].usesPoints
+        local entry = usesPoints and (sent and sent.points) or (not usesPoints and 1) or nil
+        if usesPoints then resetCount() end
+        trace(string.format("CAST %s (id %d)%s on %s", spell.name, spellID,
+            usesPoints and (" with " .. tostring(entry or "?") .. " combo points") or "", tostring(key)))
+        -- DoTs hit in ticks, so there's no single hit to learn from.
+        if entry and entry > 0 and key and not spell.periodic then
+            entry = math.min(entry, MAX_POINTS)
+            pendingCast = { spell = spell, entry = entry, key = key, at = now, hits = {}, seen = 0, hidden = 0,
+                record = ns.meter.recordCast(spell, entry, key) } -- the damage meter's fallback, if no hit is readable
             for _, hit in ipairs(recentHits) do
                 if hit.key == key and now - hit.at <= HIT_LOOKBACK then table.insert(pendingCast.hits, hit) end
             end
@@ -361,14 +451,15 @@ local function onCastSucceeded(castGUID, spellID)
     end
 end
 
--- Picks Eviscerate's hit out of what landed around the cast (white hits land too) and learns from it.
+-- Picks the spell's hit out of what landed around the cast (white hits land too) and learns from it: the
+-- largest plausible non-glancing hit. A spell without combo points would need its school checked here too.
 local function resolvePending()
     local cast = pendingCast
     pendingCast = nil
-    local ranges = rangesFor(cast.rank)
-    local range = ranges and ranges[cast.points]
+    local ranges = rangesFor(cast.spell)
+    local range = ranges and ranges[cast.entry]
     if not range then
-        trace("SKIP learning: no tooltip range for " .. cast.points .. " points")
+        trace("SKIP learning: no tooltip range for entry " .. cast.entry)
         return
     end
     local middle = (range.min + range.max) / 2
@@ -378,14 +469,16 @@ local function resolvePending()
         if plausible and hit.flag ~= "GLANCING" and (not best or hit.amount > best.amount) then best = hit end
     end
     if not best then
-        trace("SKIP learning: no plausible hit seen (dodged, or hits unreadable?)")
+        trace(string.format("SKIP hit learning: %d hit(s) on the target, %d with hidden amounts%s", cast.seen,
+            cast.hidden, cast.hidden > 0 and " (the damage meter will try after the fight)" or ""))
         return
     end
     if best.flag == "CRITICAL" then
         trace("SKIP learning: the hit was a crit (" .. best.amount .. ")")
         return
     end
-    learn(cast.finisher, cast.key, best.amount / middle, cast.points, best.amount)
+    learnRatio(cast.spell, cast.key, best.amount / middle, string.format("%d points hit %d", cast.entry, best.amount))
+    cast.record.learned = true -- so the damage meter doesn't count this cast a second time
 end
 
 local function onUnitCombat(unit, action, flag, amount, school)
@@ -401,14 +494,20 @@ local function onUnitCombat(unit, action, flag, amount, school)
             lastBuilder = nil
         end
         if pendingCast and pendingCast.key == key and now - pendingCast.at <= HIT_WINDOW then
-            trace("CAST " .. pendingCast.finisher.key .. " " .. action)
+            trace("CAST " .. pendingCast.spell.name .. " " .. action)
         end
         return
     end
     if action ~= "WOUND" then return end
     if lastBuilder and lastBuilder.key == key then lastBuilder = nil end
-    if isSecret(amount) or type(amount) ~= "number" then return end
-    if not isSecret(school) and type(school) == "number" and school ~= 1 then return end -- Eviscerate is Physical
+    local hidden = isSecret(amount) or type(amount) ~= "number"
+    if pendingCast and pendingCast.key == key and unit == "target" then
+        pendingCast.seen, hitStats.seen = pendingCast.seen + 1, hitStats.seen + 1
+        if hidden then pendingCast.hidden, hitStats.hidden = pendingCast.hidden + 1, hitStats.hidden + 1 end
+    end
+    if hidden then return end
+    -- Combo point spells are Physical (Eviscerate, Ferocious Bite).
+    if not isSecret(school) and type(school) == "number" and school ~= 1 then return end
     local plainFlag = (not isSecret(flag)) and flag or ""
 
     -- The same hit fires for target, nameplateN, softenemy...: take it once per frame.
@@ -428,6 +527,34 @@ function ns.housekeep(now)
 end
 
 ---------------------------------------------------------------------------
+-- Saved settings
+---------------------------------------------------------------------------
+
+local function loadSettings()
+    FinishHimDB = FinishHimDB or {}
+    db = FinishHimDB
+    for k, v in pairs(DEFAULTS) do
+        if db[k] == nil then db[k] = v end
+    end
+    db.samples = db.samples or {}
+    db.log = db.log or {}
+    ns.db = db
+end
+
+-- First run (or v0.1.0, which only knew Eviscerate): track Eviscerate. Its name comes from the client, so this
+-- waits for PLAYER_LOGIN. v0.1.0 saved Eviscerate's hits under the English name.
+local function ensureSpellList()
+    if db.spells then return end
+    db.spells = {}
+    local name = spellName(EVISCERATE_ID)
+    if not name then return end
+    table.insert(db.spells, { name = name, kind = "combo" })
+    if name ~= "Eviscerate" and db.samples.Eviscerate then
+        db.samples[name], db.samples.Eviscerate = db.samples.Eviscerate, nil
+    end
+end
+
+---------------------------------------------------------------------------
 -- Events
 ---------------------------------------------------------------------------
 
@@ -442,24 +569,26 @@ frame:RegisterUnitEvent("UNIT_POWER_FREQUENT", "player")
 frame:RegisterEvent("UNIT_COMBAT")
 -- Never register COMBAT_LOG_EVENT_UNFILTERED: Forever forbids it and shows a "blocked" popup.
 
+local loggedIn = false
+
 frame:SetScript("OnEvent", function(self, event, ...)
     if event == "ADDON_LOADED" then
         if ... ~= ADDON_NAME then return end
-        FinishHimDB = FinishHimDB or {}
-        db = FinishHimDB
-        for k, v in pairs(DEFAULTS) do
-            if db[k] == nil then db[k] = v end
-        end
-        db.samples = db.samples or {}
-        db.log = db.log or {}
-        ns.db = db
+        loadSettings()
         trace("===== session start =====")
         self:UnregisterEvent("ADDON_LOADED")
     elseif not db then
         return
     elseif event == "PLAYER_LOGIN" or event == "SPELLS_CHANGED" then
-        updateKnownRanks()
+        if event == "PLAYER_LOGIN" then
+            loggedIn = true
+            ensureSpellList()
+        end
+        if not loggedIn then return end
+        refreshSpells() -- new ranks, spells learned
         ns.display.setup()
+    elseif not loggedIn then
+        return
     elseif event == "PLAYER_TARGET_CHANGED" then
         resetCount() -- combo points belong to the target they were built on
         ns.display.refresh()
@@ -489,6 +618,9 @@ end)
 local function onOff(v) return v and "|cff66ff66on|r" or "|cffff6666off|r" end
 
 local HELP = {
+    "/fh add <spell> - track a combo point spell (name, or shift-click it from your spellbook)",
+    "/fh remove <spell or number> - stop tracking a spell",
+    "/fh list - show the tracked spells",
     "/fh lock | unlock - lock the pips, or unlock to drag them",
     "/fh reset - put the pips back above the target frame",
     "/fh scale <0.5-3> - size of the pips",
@@ -497,19 +629,56 @@ local HELP = {
     "/fh numbers - show/hide the damage under each pip",
     "/fh dots - also count DoesItDie's remaining DoT damage (dies eventually, not instantly)",
     "/fh test - light everything up for 10 seconds",
-    "/fh probe - print tooltip, combo point readings and estimates",
+    "/fh probe - print tooltips, combo point readings and estimates",
     "/fh forget - forget learned hits",
     "/fh debug - print the log to chat as it happens",
     "/fh toggle - turn the addon on/off",
 }
 
+local function probe()
+    refreshSpells()
+    if #ns.spells == 0 then print("No spells tracked (/fh add <spell>).") end
+    for _, spell in ipairs(ns.spells) do
+        print(string.format("%s (%s): known rank id %s%s", spell.name, spell.kind, tostring(spell.spellID),
+            spell.periodic and ", damage over time" or ""))
+        local desc = spellDescription(spell.spellID)
+        print("Tooltip: " .. (desc and desc:gsub("\r?\n", " / ") or "unreadable"))
+        local ranges = ns.tooltipRanges(spell)
+        for n = 1, KINDS[spell.kind].pips do
+            local range = ranges and ranges[n]
+            local estimate, source = ns.estimate(spell, n)
+            print(string.format("  %d: tooltip %s, estimate %s (%s)", n,
+                range and (range.min .. "-" .. range.max) or "?", tostring(estimate or "?"), source or "-"))
+        end
+    end
+    local _, readings = readComboPoints()
+    print("Combo points: " .. readings)
+    print(string.format("Hits right after your casts: %d seen, %d with hidden amounts", hitStats.seen, hitStats.hidden))
+    print("Damage meter: " .. ns.meter.status())
+    local ok, health = pcall(UnitHealth, "target")
+    print("Target health: " .. (not ok and "error" or isSecret(health) and "secret" or tostring(health)))
+end
+
 SLASH_FINISHHIM1 = "/fh"
 SLASH_FINISHHIM2 = "/finishhim"
 SlashCmdList.FINISHHIM = function(msg)
     if not db then return end
-    local cmd, arg = strtrim(msg or ""):lower():match("^(%S*)%s*(.-)$")
+    -- Only the command is lowercased: spell names and links keep their case.
+    local cmd, arg = strtrim(msg or ""):match("^(%S*)%s*(.-)$")
+    cmd = cmd:lower()
     local number = tonumber(arg)
-    if cmd == "lock" or cmd == "unlock" then
+    if cmd == "add" or cmd == "remove" then
+        local ok, message = (cmd == "add" and addSpell or removeSpell)(arg)
+        print(message)
+        if ok then ns.display.setup() end
+    elseif cmd == "list" then
+        if #db.spells == 0 then print("No spells tracked (/fh add <spell>).") end
+        for i, saved in ipairs(db.spells) do
+            local spell = spellByName[saved.name]
+            print(string.format("%d. %s (%s)%s", i, saved.name, saved.kind,
+                (spell and spell.spellID) and "" or " - not in your spellbook, hidden"))
+        end
+    elseif cmd == "lock" or cmd == "unlock" then
         db.locked = cmd == "lock"
         ns.display.setup()
         print(db.locked and "Locked." or "Unlocked: drag the pips. /fh lock when done.")
@@ -537,24 +706,7 @@ SlashCmdList.FINISHHIM = function(msg)
     elseif cmd == "test" then
         ns.display.test(10)
     elseif cmd == "probe" then
-        updateKnownRanks()
-        for _, finisher in ipairs(FINISHERS) do
-            local id = activeRank[finisher.key]
-            print(finisher.key .. ": known rank id " .. tostring(id))
-            local desc = id and spellDescription(id)
-            print("Tooltip: " .. (desc and desc:gsub("\r?\n", " / ") or "unreadable"))
-            local ranges = ns.tooltipRanges(finisher)
-            for points = 1, MAX_POINTS do
-                local range = ranges and ranges[points]
-                local estimate, source = ns.estimate(finisher, points)
-                print(string.format("  %d: tooltip %s, estimate %s (%s)", points,
-                    range and (range.min .. "-" .. range.max) or "?", tostring(estimate or "?"), source or "-"))
-            end
-        end
-        local _, readings = readComboPoints()
-        print("Combo points: " .. readings)
-        local ok, health = pcall(UnitHealth, "target")
-        print("Target health: " .. (not ok and "error" or isSecret(health) and "secret" or tostring(health)))
+        probe()
     elseif cmd == "forget" then
         ns.forget()
         print("Learned hits forgotten.")
