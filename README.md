@@ -21,8 +21,8 @@ Above the target frame there's one row per spell, with its icon on the left. For
 For single cast spells, the big skull lights up when the spell kills, and the number next to it is its damage.
 
 **Health bar marker:** a colored chunk at the end of the target's green health bar shows how much the spell takes
-off. If it covers all the green that's left, the spell kills. Each spell has its own color. Turn a spell's marker
-on or off with its **Bar** checkbox in the options window, or all of them with `/fh markers`.
+off. If it covers all the green that's left, the spell kills. Each spell has its own color. Every spell has one; for combo
+point spells it shows the damage at your current combo points. Turn a spell's marker on or off with its **Bar** checkbox in the options window, or all of them with `/fh markers`.
 
 Hover the row to see the estimates and where they come from.
 

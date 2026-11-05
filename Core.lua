@@ -204,7 +204,8 @@ end
 -- Tracked spells
 ---------------------------------------------------------------------------
 -- db.spells is the saved list { { name, kind, marker } } in display order, by name so any rank matches. marker:
--- draw the spell's damage on the target's health bar (default on for single cast spells).
+-- draw the spell's damage on the target's health bar (on unless turned off; combo spells mark the damage at
+-- the current combo points).
 -- ns.spells is the same list with what this session knows: { name, kind, marker, spellID (highest known rank or
 -- nil), icon, periodic, school }. Rows of spells the player doesn't know (other class, not learned yet) stay hidden.
 
@@ -235,7 +236,7 @@ local function refreshSpells()
             local _, icon, spellID = spellInfo(saved.name)
             local desc = spellDescription(spellID)
             local ranges = KINDS[saved.kind].parse(desc)
-            local spell = { name = saved.name, kind = saved.kind, marker = saved.marker and true or false,
+            local spell = { name = saved.name, kind = saved.kind, marker = saved.marker ~= false,
                 spellID = spellID, icon = icon, periodic = isPeriodic(desc, saved.kind),
                 school = ranges and ranges.school or 1 }
             table.insert(ns.spells, spell)
@@ -263,7 +264,7 @@ local function addSpell(input)
         return false, name .. " has no fixed damage in its tooltip (weapon-based, damage over time, or no damage), "
             .. "so it can't be predicted."
     end
-    table.insert(db.spells, { name = name, kind = kind, marker = kind == "direct" })
+    table.insert(db.spells, { name = name, kind = kind, marker = true })
     refreshSpells()
     local spell = spellByName[name]
     return true, string.format("Tracking %s (%s%s).", name, KINDS[kind].label,
@@ -790,6 +791,7 @@ local function probe()
     print("Combo points: " .. readings)
     print(string.format("Hits right after your casts: %d seen, %d with hidden amounts", hitStats.seen, hitStats.hidden))
     print("Damage meter: " .. ns.meter.status())
+    print("Health bar markers: " .. ns.display.markerStatus())
     local ok, health = pcall(UnitHealth, "target")
     print("Target health: " .. (not ok and "error" or isSecret(health) and "secret" or tostring(health)))
 end

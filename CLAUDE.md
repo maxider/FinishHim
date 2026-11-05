@@ -81,11 +81,13 @@ Eviscerate's tooltip also matches the direct parser).
 
 ## Health bar markers (Display.lua)
 
-Spells with `marker` on (the default for direct spells; the "Bar" checkbox in options) get a chunk drawn at the
+Spells with `marker` on (on unless set to `false`; the "Bar" checkbox in options; combo spells mark the
+damage at the current combo points) get a chunk drawn at the
 end of the target's health fill, reaching left. It's a StatusBar as wide as the health bar, pinned with its right
 edge to the health bar's fill texture (`GetStatusBarTexture()`), `SetReverseFill(true)`, max = `UnitHealthMax`,
 value = damage. A clipping frame over the health bar cuts off overkill. Biggest damage first, so smaller chunks
 draw on top. Only Blizzard's target frame health bar is found (`findTargetHealthBar`, same paths as DoesItDie).
+`/fh test` draws test markers (30%, 15%, ... of the bar); `/fh probe` prints `display.markerStatus()`.
 Unverified in-game so far.
 
 ## Working on it

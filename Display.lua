@@ -192,13 +192,78 @@ end
 -- health fill's right edge, filling right to left, with max = max health and value = damage. Its fill is then
 -- exactly the damage on the health bar's scale. A clipping frame over the health bar cuts off whatever reaches
 -- past the bar's left edge (overkill).
+-- The "health fill's right edge" is our own invisible copy of the health bar (healthMirror: max = max health,
+-- value = health), not Blizzard's fill texture: anchoring to our own secret-sized fill is what DoesItDie does
+-- in-game. And the markers are kept above the highest layer anywhere in the target frame (see
+-- targetFrameTopLayer): Blizzard re-layers that frame after addons load, and some of its frames report a secret
+-- level, so a level copied from the health bar once can leave the markers drawn underneath it.
 
 local MARKER_COLORS = { { 0.25, 0.8, 1 }, { 1, 0.6, 0.15 }, { 0.8, 0.45, 1 }, { 0.35, 1, 0.45 } }
 local markerClip = CreateFrame("Frame", "FinishHimMarkers", UIParent)
 markerClip:SetClipsChildren(true)
 markerClip:Hide()
 local markers = {}
-local markerHost, markerHostFill -- the target frame's health bar and its fill texture
+local markerHost -- the target frame's health bar the markers sit on
+
+local healthMirror = CreateFrame("StatusBar", nil, markerClip)
+healthMirror:SetAllPoints(markerClip)
+healthMirror:SetStatusBarTexture(WHITE)
+healthMirror:SetStatusBarColor(0, 0, 0, 0)
+healthMirror:SetMinMaxValues(0, 1)
+healthMirror:SetValue(1)
+local healthEnd = healthMirror:GetStatusBarTexture() -- its right edge is where the target's health ends
+
+local STRATA_RANK = {
+    BACKGROUND = 1, LOW = 2, MEDIUM = 3, HIGH = 4, DIALOG = 5, FULLSCREEN = 6, FULLSCREEN_DIALOG = 7, TOOLTIP = 8,
+}
+local LAYER_CHECK_INTERVAL = 1
+
+-- Highest strata and level anywhere in the target frame's tree (DoesItDie's targetFrameTopLayer). Frames that
+-- report a secret strata or level are skipped; their children are still visited.
+local function targetFrameTopLayer(root)
+    local topStrata, topLevel = "BACKGROUND", 0
+    local function visit(frame, depth)
+        local strata, level = frame:GetFrameStrata(), frame:GetFrameLevel()
+        if not ns.isSecret(strata) and not ns.isSecret(level) then
+            local rank, topRank = STRATA_RANK[strata] or 0, STRATA_RANK[topStrata] or 0
+            if rank > topRank then
+                topStrata, topLevel = strata, level
+            elseif rank == topRank and level > topLevel then
+                topLevel = level
+            end
+        end
+        if depth < 6 then
+            for _, child in ipairs({ frame:GetChildren() }) do visit(child, depth + 1) end
+        end
+    end
+    visit(root, 0)
+    return topStrata, topLevel
+end
+
+local layerCheckedAt, layerStrata, layerLevel = 0, nil, nil
+
+-- Puts the markers above everything on the target frame. Throttled: Blizzard can re-layer it at any time.
+local function updateMarkerLayer(force)
+    local now = GetTime()
+    if not force and now - layerCheckedAt < LAYER_CHECK_INTERVAL then return end
+    layerCheckedAt = now
+    local ok, strata, level = pcall(targetFrameTopLayer, TargetFrame or markerHost)
+    if not ok then
+        ns.trace("MARKER layer check failed: " .. tostring(strata))
+        return
+    end
+    if strata ~= layerStrata or level ~= layerLevel then
+        layerStrata, layerLevel = strata, level
+        ns.trace(string.format("MARKER target frame top is %s/%d; markers placed above it", strata, level))
+    end
+    markerClip:SetFrameStrata(strata)
+    markerClip:SetFrameLevel(level + 1)
+    healthMirror:SetFrameLevel(level + 2)
+    for i, marker in ipairs(markers) do
+        marker.bar:SetFrameStrata(strata)
+        marker.bar:SetFrameLevel(level + 3 + i)
+    end
+end
 
 local function findTargetHealthBar()
     local tf = TargetFrame
@@ -238,20 +303,16 @@ end
 local function attachMarkers()
     local bar = findTargetHealthBar()
     if bar ~= markerHost then
-        markerHost, markerHostFill = bar, nil
+        markerHost = bar
         if bar then
-            local ok, fill = pcall(bar.GetStatusBarTexture, bar)
-            markerHostFill = ok and fill or nil
             markerClip:ClearAllPoints()
             markerClip:SetAllPoints(bar)
-            pcall(function()
-                markerClip:SetFrameStrata(bar:GetFrameStrata())
-                markerClip:SetFrameLevel(bar:GetFrameLevel() + 5)
-            end)
             for _, marker in ipairs(markers) do marker.width = nil end
+            updateMarkerLayer(true)
         end
     end
-    if not (markerHost and markerHostFill) then return false end
+    if not markerHost then return false end
+    updateMarkerLayer()
     local ok, visible = pcall(markerHost.IsVisible, markerHost)
     return ok and not ns.isSecret(visible) and visible
 end
@@ -261,27 +322,31 @@ local function hideMarkers()
 end
 
 -- entries: { damage, colorIndex } of the spells to mark. Needs a pcall around it (max health is secret).
-local function updateMarkers(entries)
+-- maxOverride: a plain scale instead of max health (test mode: damage 0.3 = 30% of the bar).
+local function updateMarkers(entries, maxOverride)
     if not ns.db.showMarkers or #entries == 0 or not attachMarkers() then return hideMarkers() end
     local okWidth, width = pcall(markerHost.GetWidth, markerHost)
     if not okWidth or ns.isSecret(width) or type(width) ~= "number" or width <= 0 then width = 120 end
     -- Biggest first, so smaller chunks draw on top of it and stay visible.
     table.sort(entries, function(a, b) return a.damage > b.damage end)
-    local maxHealth = UnitHealthMax("target")
-    local level = markerClip:GetFrameLevel()
+    local maxHealth = maxOverride or UnitHealthMax("target")
+    healthMirror:SetMinMaxValues(0, maxHealth)
+    healthMirror:SetValue(maxOverride and maxOverride or UnitHealth("target"))
+    local level = markerClip:GetFrameLevel() + 2
     for i, entry in ipairs(entries) do
         local marker = markers[i] or createMarker()
         markers[i] = marker
         if marker.width ~= width then
             marker.width = width
             marker.bar:ClearAllPoints()
-            marker.bar:SetPoint("TOPRIGHT", markerHostFill, "TOPRIGHT")
-            marker.bar:SetPoint("BOTTOMRIGHT", markerHostFill, "BOTTOMRIGHT")
+            marker.bar:SetPoint("TOPRIGHT", healthEnd, "TOPRIGHT")
+            marker.bar:SetPoint("BOTTOMRIGHT", healthEnd, "BOTTOMRIGHT")
             marker.bar:SetWidth(width)
         end
         local color = MARKER_COLORS[(entry.colorIndex - 1) % #MARKER_COLORS + 1]
         marker.fill:SetColorTexture(color[1], color[2], color[3], 0.35)
         for _, edge in ipairs(marker.edges) do edge:SetColorTexture(color[1], color[2], color[3], 0.95) end
+        marker.bar:SetFrameStrata(markerClip:GetFrameStrata())
         marker.bar:SetFrameLevel(level + i)
         marker.bar:SetMinMaxValues(0, maxHealth)
         marker.bar:SetValue(entry.damage)
@@ -292,6 +357,27 @@ local function updateMarkers(entries)
 end
 
 -- The color a spell's marker gets: by its place in the tracked list, so it stays put while others come and go.
+-- For /fh probe: why the markers do or don't show.
+function display.markerStatus()
+    local parts = { ns.db.showMarkers and "on" or "turned off (/fh markers)" }
+    local bar = findTargetHealthBar()
+    if not bar then
+        table.insert(parts, "target frame health bar NOT found")
+    else
+        table.insert(parts, "health bar found")
+        local ok, visible = pcall(bar.IsVisible, bar)
+        table.insert(parts, "visible=" .. (not ok and "error" or ns.isSecret(visible) and "secret" or tostring(visible)))
+    end
+    local on = {}
+    for _, spell in ipairs(ns.spells) do
+        if spell.marker then table.insert(on, spell.name) end
+    end
+    table.insert(parts, #on > 0 and ("marked: " .. table.concat(on, ", ")) or "no spell has its Bar box ticked")
+    table.insert(parts, string.format("drawing %s at %s/%s", markerClip:IsShown() and "yes" or "no",
+        tostring(markerClip:GetFrameStrata()), tostring(markerClip:GetFrameLevel())))
+    return table.concat(parts, "; ")
+end
+
 function display.markerColor(index)
     return MARKER_COLORS[(index - 1) % #MARKER_COLORS + 1]
 end
@@ -388,6 +474,15 @@ local function showTest()
     end
     layout(shown)
     container:SetShown(#shown > 0)
+    -- Test markers: 30%, 15%, 10%... of the health bar, for spells with their marker on (needs a target, since
+    -- the target frame is hidden without one).
+    local entries = {}
+    for _, index in ipairs(shown) do
+        if rows[index].spell.marker then
+            table.insert(entries, { damage = 0.3 / (#entries + 1), colorIndex = rows[index].colorIndex or index })
+        end
+    end
+    pcall(updateMarkers, entries, 1)
 end
 
 -- Plain numbers for one row: the estimate per pip, the pip that's "now" (current combo points), and whether the
