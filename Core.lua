@@ -28,6 +28,7 @@ local DEFAULTS = {
     locked = true,
     scale = 1,
     point = nil,          -- { point, relativePoint, x, y } on UIParent once dragged; nil = above the target frame
+    useTooltip = true,    -- estimate = the tooltip's minimum as is (no armor, stats or learned ratio)
     margin = 0,           -- percent taken off every estimate, to be extra careful
     guessFactor = 0.75,   -- tooltip minimum x this, until a real hit has been seen (armor isn't in the tooltip)
     showNumbers = true,
@@ -428,13 +429,18 @@ end
 
 -- Lowest normal hit of `spell` at entry `n` (combo points) on the target, a source description, and true when
 -- it's only guessed from the tooltip (Display greys those). nil if unknown.
+-- With useTooltip on, it's the tooltip's minimum as is: learning still runs, but isn't used.
+-- 4th result: the same estimate from the tooltip's maximum (the best normal roll), for the "could kill" box.
 function ns.estimate(spell, n)
     local ranges = rangesFor(spell)
     local range = ranges and ranges[n]
     if not range then return nil end
-    local ratio, source, guessed = ratioFor(spell, unitKey("target"))
-    local damage = range.min * ratio * (1 - db.margin / 100)
-    return math.max(0, math.floor(damage)), source, guessed or false
+    local ratio, source, guessed = 1, "tooltip minimum", false
+    if not db.useTooltip then ratio, source, guessed = ratioFor(spell, unitKey("target")) end
+    local scale = ratio * (1 - db.margin / 100)
+    local low = math.max(0, math.floor(range.min * scale))
+    local high = math.max(low, math.floor((range.max or range.min) * scale))
+    return low, source, guessed or false, high
 end
 
 function ns.tooltipRanges(spell)
@@ -759,6 +765,7 @@ local HELP = {
     "/fh lock | unlock - lock the pips, or unlock to drag them",
     "/fh reset - put the pips back above the target frame",
     "/fh scale <0.5-3> - size of the pips",
+    "/fh tooltip - toggle using the tooltip's minimum as is (on) or learned damage (off)",
     "/fh margin <0-50> - take this % off every estimate (extra careful)",
     "/fh guess <0.3-1.5> - tooltip multiplier used until a real hit is seen (default 0.75)",
     "/fh numbers - show/hide the damage under each pip",
@@ -831,6 +838,12 @@ SlashCmdList.FINISHHIM = function(msg)
     elseif cmd == "scale" and number then
         db.scale = math.max(0.5, math.min(3, number))
         ns.display.setup()
+    elseif cmd == "tooltip" then
+        db.useTooltip = not db.useTooltip
+        print(db.useTooltip and "Using the tooltip's minimum damage as is."
+            or "Using learned damage (tooltip x what your hits did).")
+        ns.display.setup()
+        if ns.refreshOptions then ns.refreshOptions() end
     elseif cmd == "margin" and number then
         db.margin = math.max(0, math.min(50, number))
         print(string.format("Estimates reduced by %d%%.", db.margin))

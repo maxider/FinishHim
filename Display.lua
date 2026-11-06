@@ -76,7 +76,12 @@ local function showTooltip(row)
     for n = 1, kind.pips do
         local estimate, from = ns.estimate(spell, n)
         local left = kind.usesPoints and (n .. (n == 1 and " point" or " points")) or "Damage"
-        GameTooltip:AddDoubleLine(left, estimate and (estimate .. " or more") or "?", 1, 1, 1, 1, 1, 1)
+        local _, _, _, high = ns.estimate(spell, n)
+        local text = "?"
+        if estimate then
+            text = (high and high > estimate) and string.format("%d-%d", estimate, high) or tostring(estimate)
+        end
+        GameTooltip:AddDoubleLine(left, text, 1, 1, 1, 1, 1, 1)
         lastSource = from or lastSource
     end
     if lastSource then GameTooltip:AddLine("Estimate: " .. lastSource, 0.7, 0.7, 0.7, true) end
@@ -89,6 +94,8 @@ local function showTooltip(row)
         GameTooltip:AddLine("Lowest normal hit, no crit. A miss, dodge, parry or resist still saves it.",
             0.7, 0.7, 0.7, true)
     end
+    GameTooltip:AddLine("Yellow: the highest roll would kill, so it could. Red skull: even the lowest roll kills.",
+        1, 0.82, 0, true)
     if spell.marker and ns.db.showMarkers then
         GameTooltip:AddLine("Its damage is marked on the target's health bar: if the marker covers all the health "
             .. "that's left, it dies.", 0.7, 0.7, 0.7, true)
@@ -121,8 +128,14 @@ local function createRow()
     bigBack:SetSize(BIG, BIG)
     bigBack:SetPoint("TOPLEFT", row, "TOPLEFT", ICON + GAP, 0)
     bigBack:SetColorTexture(0, 0, 0, 0.35)
+    -- Yellow box behind the skull: the best normal roll (tooltip maximum) would kill.
+    local bigMaxWindow, bigMaxBar, bigMaxLit = killWindow(row, BIG)
+    bigMaxWindow:SetAllPoints(bigBack)
+    bigMaxWindow:SetFrameLevel(row:GetFrameLevel() + 1)
+    bigMaxLit:SetColorTexture(1, 0.82, 0, 0.55)
     local bigWindow, bigBar, bigSkull = killWindow(row, BIG)
     bigWindow:SetAllPoints(bigBack)
+    bigWindow:SetFrameLevel(row:GetFrameLevel() + 2)
     bigSkull:SetTexture(SKULL)
 
     -- Single cast spells: their damage, next to the big skull.
@@ -147,8 +160,14 @@ local function createRow()
         back:SetAllPoints()
         back:SetColorTexture(0.08, 0.08, 0.08, 0.85)
 
+        -- Yellow under the red: the best normal roll would kill (red covers it once the lowest roll does).
+        local maxWindow, maxBar, maxLit = killWindow(pip, PIP)
+        maxWindow:SetAllPoints()
+        maxWindow:SetFrameLevel(pip:GetFrameLevel() + 1)
+        maxLit:SetColorTexture(0.85, 0.65, 0, 0.9)
         local window, bar, lit = killWindow(pip, PIP)
         window:SetAllPoints()
+        window:SetFrameLevel(pip:GetFrameLevel() + 2)
         lit:SetColorTexture(0.75, 0.08, 0.08, 0.95)
         local skull = bar:CreateTexture(nil, "OVERLAY")
         skull:SetTexture(SKULL)
@@ -166,10 +185,11 @@ local function createRow()
         local damage = labels:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
         damage:SetPoint("TOP", pip, "BOTTOM", 0, -3)
 
-        pips[i] = { frame = pip, border = border, bar = bar, damage = damage }
+        pips[i] = { frame = pip, border = border, bar = bar, maxBar = maxBar, damage = damage }
     end
 
-    return { frame = row, icon = icon, bigWindow = bigWindow, bigBar = bigBar, bigDamage = bigDamage, pips = pips }
+    return { frame = row, icon = icon, bigWindow = bigWindow, bigBar = bigBar, bigMaxWindow = bigMaxWindow,
+        bigMaxBar = bigMaxBar, bigDamage = bigDamage, pips = pips }
 end
 
 -- Fits a row to its spell: icon, and pips for combo point spells or the damage number for single cast ones.
@@ -461,13 +481,17 @@ local function showTest()
             table.insert(shown, index)
             for i, pip in ipairs(row.pips) do
                 pip.bar:SetMinMaxValues(0, 1)
-                pip.bar:SetValue(1)
+                pip.bar:SetValue(i >= 3 and 1 or 0)
+                pip.maxBar:SetMinMaxValues(0, 1)
+                pip.maxBar:SetValue(i >= 2 and 1 or 0)
                 pip.damage:SetText(i * 100)
                 pip.damage:SetTextColor(LEARNED_COLOR[1], LEARNED_COLOR[2], LEARNED_COLOR[3])
                 setBorder(pip, i == 3)
             end
             row.bigBar:SetMinMaxValues(0, 1)
             row.bigBar:SetValue(1)
+            row.bigMaxBar:SetMinMaxValues(0, 1)
+            row.bigMaxBar:SetValue(1)
             row.bigDamage:SetText(250)
             row.bigDamage:SetTextColor(LEARNED_COLOR[1], LEARNED_COLOR[2], LEARNED_COLOR[3])
         end
@@ -489,14 +513,14 @@ end
 -- estimates are still the tooltip guess.
 local function rowNumbers(spell, current)
     local kind = ns.kinds[spell.kind]
-    local estimates, guessed = {}, false
+    local estimates, highs, guessed = {}, {}, false
     for n = 1, kind.pips do
-        local estimate, _, isGuess = ns.estimate(spell, n)
-        estimates[n] = estimate
+        local estimate, _, isGuess, high = ns.estimate(spell, n)
+        estimates[n], highs[n] = estimate, high
         guessed = guessed or (estimate ~= nil and isGuess)
     end
     local nowEntry = kind.usesPoints and current or 1
-    return estimates, nowEntry, guessed
+    return estimates, nowEntry, guessed, highs
 end
 
 local function update()
@@ -516,9 +540,9 @@ local function update()
     for index, row in ipairs(rows) do
         local spell = row.spell
         if spell and spell.spellID then
-            local estimates, nowEntry, guessed = rowNumbers(spell, current)
+            local estimates, nowEntry, guessed, highs = rowNumbers(spell, current)
             local color = guessed and GUESSED_COLOR or LEARNED_COLOR
-            numbers[index] = { estimates = estimates, nowEntry = nowEntry }
+            numbers[index] = { estimates = estimates, highs = highs, nowEntry = nowEntry }
             table.insert(shown, index)
             for i, pip in ipairs(row.pips) do
                 pip.damage:SetText(estimates[i] or "?")
@@ -531,6 +555,7 @@ local function update()
             -- Counted points may be off by one: the big skull is dimmer then.
             local sure = source == "read" or not ns.kinds[spell.kind].usesPoints
             row.bigWindow:SetAlpha(sure and 1 or 0.6)
+            row.bigMaxWindow:SetAlpha(sure and 1 or 0.6)
         end
     end
     if #shown == 0 then
@@ -546,10 +571,15 @@ local function update()
             for i, pip in ipairs(row.pips) do
                 pip.bar:SetMinMaxValues(0, health)
                 pip.bar:SetValue(n.estimates[i] and (n.estimates[i] + dots) or 0)
+                pip.maxBar:SetMinMaxValues(0, health)
+                pip.maxBar:SetValue(n.highs[i] and (n.highs[i] + dots) or 0)
             end
             local now = n.nowEntry >= 1 and n.estimates[n.nowEntry]
+            local nowHigh = n.nowEntry >= 1 and n.highs[n.nowEntry]
             row.bigBar:SetMinMaxValues(0, health)
             row.bigBar:SetValue(now and (now + dots) or 0)
+            row.bigMaxBar:SetMinMaxValues(0, health)
+            row.bigMaxBar:SetValue(nowHigh and (nowHigh + dots) or 0)
             if row.spell.marker and now and now > 0 then
                 table.insert(marked, { damage = now, colorIndex = row.colorIndex or index })
             end

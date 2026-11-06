@@ -28,6 +28,9 @@ problems for DoTs. Check there first when unsure how Forever behaves.
   addon's own count of builders.
 - **Err low.** A false kill skull is worse than a missed one. Estimates use the tooltip's minimum roll, no crits,
   and learned ratios (a cautious low quartile across mobs). Keep it that way.
+- **Tooltip mode (`useTooltip`, default on, the user's choice):** the estimate is the tooltip's minimum as is, with
+  no guess factor, learned ratio or stats (only the safety margin, which defaults to 0). Learning still records
+  in the background and is used once the setting is off (`/fh tooltip` or the options checkbox).
 
 ## Files
 

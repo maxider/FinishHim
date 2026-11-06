@@ -159,6 +159,7 @@ local function trackedStatus(spell)
     if not spell.spellID then return "|cffff6666not in your spellbook (hidden)|r" end
     local kind = ns.kinds[spell.kind].short
     if spell.periodic then return kind .. ", damage over time" end
+    if ns.db.useTooltip then return kind .. ", tooltip minimum" end
     local count = ns.learnedCount(spell.name)
     if count > 0 then
         return string.format("%s, |cffffd100learned (%d)|r", kind, count)
@@ -334,6 +335,7 @@ local function createWindow()
         checkbox("Lock position", "locked"),
         checkbox("Add DoesItDie's DoT damage", "includeDots"),
         checkbox("Health bar markers", "showMarkers"),
+        checkbox("Use tooltip minimum", "useTooltip"),
     }
     widgets.sliders = {
         slider("Size", "scale", 0.5, 3, 0.1, function(v) return string.format("%.1fx", v) end),
