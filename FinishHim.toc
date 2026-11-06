@@ -8,4 +8,5 @@
 Core.lua
 Meter.lua
 Display.lua
+Nameplate.lua
 Options.lua

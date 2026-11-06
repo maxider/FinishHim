@@ -32,7 +32,11 @@ local DEFAULTS = {
     margin = 0,           -- percent taken off every estimate, to be extra careful
     guessFactor = 0.75,   -- tooltip minimum x this, until a real hit has been seen (armor isn't in the tooltip)
     showNumbers = true,
-    showMarkers = true,   -- health bar markers for spells that have them turned on
+    showMarkers = true,
+    plateDots = true,     -- combo dots above the target's nameplate (Plater or Blizzard)
+    plateMarker = true,   -- the damage marker on the target's nameplate health bar
+    plateDotSize = 11,
+    plateDotsOffset = 4,  -- pixels between the nameplate health bar and the dots   -- health bar markers for spells that have them turned on
     includeDots = false,  -- add DoesItDie's remaining DoT damage (dies eventually, not instantly)
     debug = false,
 }
@@ -799,6 +803,7 @@ local function probe()
     print(string.format("Hits right after your casts: %d seen, %d with hidden amounts", hitStats.seen, hitStats.hidden))
     print("Damage meter: " .. ns.meter.status())
     print("Health bar markers: " .. ns.display.markerStatus())
+    print("Nameplate: " .. ns.plate.status())
     local ok, health = pcall(UnitHealth, "target")
     print("Target health: " .. (not ok and "error" or isSecret(health) and "secret" or tostring(health)))
 end

@@ -91,7 +91,19 @@ edge to the health bar's fill texture (`GetStatusBarTexture()`), `SetReverseFill
 value = damage. A clipping frame over the health bar cuts off overkill. Biggest damage first, so smaller chunks
 draw on top. Only Blizzard's target frame health bar is found (`findTargetHealthBar`, same paths as DoesItDie).
 `/fh test` draws test markers (30%, 15%, ... of the bar); `/fh probe` prints `display.markerStatus()`.
-Unverified in-game so far.
+The markers anchor to our own invisible health mirror (not Blizzard's fill texture), and are kept above the
+highest layer in the TargetFrame tree (`targetFrameTopLayer`, every 1s). Unverified in-game so far.
+
+## Nameplate (Nameplate.lua)
+
+Only the target's plate (`C_NamePlate.GetNamePlateForUnit("target")`), since combo points are per target. The
+health bar is Plater's `plate.unitFrame.healthBar` (lowercase), else Blizzard's `plate.UnitFrame.healthBar`.
+- Dots (`plateDots`): 5 round dots for the first tracked combo spell, above the bar (`plateDotsOffset`,
+  `plateDotSize`). Each has a yellow kill window (tooltip max) under a red one (tooltip min), like the pips.
+- Marker (`plateMarker`, also needs `showMarkers`): the same chunk as on the target frame, in a clip over the
+  plate's bar, pinned to an invisible health mirror.
+- The widgets are one set, re-parented to the target's plate. Their strata matches the bar and their level is
+  the bar's level plus an offset (200 if secret). `/fh probe` prints `ns.plate.status()`. Unverified in-game.
 
 ## Working on it
 

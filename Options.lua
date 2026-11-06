@@ -336,9 +336,13 @@ local function createWindow()
         checkbox("Add DoesItDie's DoT damage", "includeDots"),
         checkbox("Health bar markers", "showMarkers"),
         checkbox("Use tooltip minimum", "useTooltip"),
+        checkbox("Nameplate combo dots", "plateDots"),
+        checkbox("Nameplate damage marker", "plateMarker"),
     }
     widgets.sliders = {
         slider("Size", "scale", 0.5, 3, 0.1, function(v) return string.format("%.1fx", v) end),
+        slider("Nameplate dot size", "plateDotSize", 6, 20, 1, function(v) return string.format("%d px", v) end),
+        slider("Nameplate dot height", "plateDotsOffset", -40, 40, 1, function(v) return string.format("%+d px", v) end),
         slider("Safety margin", "margin", 0, 50, 1, function(v) return string.format("-%d%%", v) end),
         slider("Guess before learning", "guessFactor", 0.3, 1.5, 0.05,
             function(v) return string.format("tooltip x %.2f", v) end),

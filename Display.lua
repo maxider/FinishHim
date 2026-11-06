@@ -658,6 +658,11 @@ function display.test(seconds)
     display.refresh()
 end
 
+-- For Nameplate.lua: whether test mode is showing.
+function display.testing()
+    return testUntil ~= nil and GetTime() < testUntil
+end
+
 local driver = CreateFrame("Frame")
 local sinceUpdate = 0
 driver:SetScript("OnUpdate", function(_, elapsed)
