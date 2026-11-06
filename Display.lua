@@ -2,7 +2,8 @@
 -- A row is the spell's icon, a big skull, and for combo point spells one pip per point count (single cast spells
 -- show their damage number instead of pips).
 -- Pip N lights up (red, with a skull) when the spell with N points would kill the target, so the lowest lit pip
--- is the fewest points you need. The pip for your current points has a gold border, and the big skull lights up
+-- is the fewest points you need. Pips are round like combo points: the ones you have get a gold ring (the
+-- current count also glows, and a ring pops when gained), and the big skull lights up
 -- when the spell kills right now. Spells the player doesn't know have no row.
 --
 -- Target health is secret, so Lua can't compare it with the damage. Each pip is a StatusBar instead (the trick
@@ -15,6 +16,9 @@ local ADDON_NAME, ns = ...
 local WHITE = "Interface\\Buttons\\WHITE8X8"
 local SKULL = "Interface\\TargetingFrame\\UI-RaidTargetingIcon_8"
 local QUESTION = "Interface\\Icons\\INV_Misc_QuestionMark"
+local CIRCLE = "Interface\\CharacterFrame\\TempPortraitAlphaMask" -- white disc, tinted with SetVertexColor
+local OWNED_COLOR = { 1, 0.78, 0.1 }    -- ring of a combo point you have
+local EMPTY_COLOR = { 0.32, 0.32, 0.34 } -- ring of one you don't
 local BAR_LENGTH = 10000 -- a pip starts lighting PIP / BAR_LENGTH (~0.25%) of health short of lethal
 local PIP = 24
 local GAP = 4
@@ -127,12 +131,14 @@ local function createRow()
     local bigBack = row:CreateTexture(nil, "BACKGROUND")
     bigBack:SetSize(BIG, BIG)
     bigBack:SetPoint("TOPLEFT", row, "TOPLEFT", ICON + GAP, 0)
-    bigBack:SetColorTexture(0, 0, 0, 0.35)
+    bigBack:SetTexture(CIRCLE)
+    bigBack:SetVertexColor(0, 0, 0, 0.5)
     -- Yellow box behind the skull: the best normal roll (tooltip maximum) would kill.
     local bigMaxWindow, bigMaxBar, bigMaxLit = killWindow(row, BIG)
     bigMaxWindow:SetAllPoints(bigBack)
     bigMaxWindow:SetFrameLevel(row:GetFrameLevel() + 1)
-    bigMaxLit:SetColorTexture(1, 0.82, 0, 0.55)
+    bigMaxLit:SetTexture(CIRCLE)
+    bigMaxLit:SetVertexColor(1, 0.82, 0, 0.6)
     local bigWindow, bigBar, bigSkull = killWindow(row, BIG)
     bigWindow:SetAllPoints(bigBack)
     bigWindow:SetFrameLevel(row:GetFrameLevel() + 2)
@@ -153,22 +159,47 @@ local function createRow()
         pip:SetSize(PIP, PIP)
         pip:SetPoint("LEFT", bigBack, "RIGHT", GAP * 2 + (i - 1) * (PIP + GAP), 0)
 
+        -- A round combo point: soft glow (current points only), ring (gold once you have the point), dark disc.
+        local glow = pip:CreateTexture(nil, "BACKGROUND", nil, -3)
+        glow:SetTexture(CIRCLE)
+        glow:SetPoint("TOPLEFT", -7, 7)
+        glow:SetPoint("BOTTOMRIGHT", 7, -7)
+        glow:SetVertexColor(1, 0.75, 0.1, 0.35)
+        glow:SetBlendMode("ADD")
+        glow:Hide()
         local border = pip:CreateTexture(nil, "BACKGROUND", nil, -1)
+        border:SetTexture(CIRCLE)
         border:SetPoint("TOPLEFT", -2, 2)
         border:SetPoint("BOTTOMRIGHT", 2, -2)
         local back = pip:CreateTexture(nil, "BACKGROUND")
+        back:SetTexture(CIRCLE)
         back:SetAllPoints()
-        back:SetColorTexture(0.08, 0.08, 0.08, 0.85)
+        back:SetVertexColor(0.07, 0.07, 0.08, 0.95)
+
+        -- Pop when the point is gained: the ring starts big and settles.
+        local pop = border:CreateAnimationGroup()
+        local grow = pop:CreateAnimation("Scale")
+        if grow.SetScaleFrom then
+            grow:SetScaleFrom(1.45, 1.45)
+            grow:SetScaleTo(1, 1)
+        elseif grow.SetFromScale then
+            grow:SetFromScale(1.45, 1.45)
+            grow:SetToScale(1, 1)
+        end
+        grow:SetDuration(0.18)
+        if grow.SetSmoothing then grow:SetSmoothing("OUT") end
 
         -- Yellow under the red: the best normal roll would kill (red covers it once the lowest roll does).
         local maxWindow, maxBar, maxLit = killWindow(pip, PIP)
         maxWindow:SetAllPoints()
         maxWindow:SetFrameLevel(pip:GetFrameLevel() + 1)
-        maxLit:SetColorTexture(0.85, 0.65, 0, 0.9)
+        maxLit:SetTexture(CIRCLE)
+        maxLit:SetVertexColor(0.9, 0.68, 0, 0.95)
         local window, bar, lit = killWindow(pip, PIP)
         window:SetAllPoints()
         window:SetFrameLevel(pip:GetFrameLevel() + 2)
-        lit:SetColorTexture(0.75, 0.08, 0.08, 0.95)
+        lit:SetTexture(CIRCLE)
+        lit:SetVertexColor(0.8, 0.08, 0.06, 1)
         local skull = bar:CreateTexture(nil, "OVERLAY")
         skull:SetTexture(SKULL)
         skull:SetSize(PIP - 6, PIP - 6)
@@ -179,13 +210,20 @@ local function createRow()
         local labels = CreateFrame("Frame", nil, pip)
         labels:SetAllPoints()
         labels:SetFrameLevel(window:GetFrameLevel() + 5)
+        -- Glassy shine on the top half, so the dot reads as a bead.
+        local shine = labels:CreateTexture(nil, "ARTWORK")
+        shine:SetTexture(CIRCLE)
+        shine:SetSize(PIP * 0.55, PIP * 0.3)
+        shine:SetPoint("TOP", pip, "TOP", 0, -2)
+        shine:SetVertexColor(1, 1, 1, 0.16)
         local number = labels:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
         number:SetPoint("CENTER", 0, 0)
         number:SetText(i)
         local damage = labels:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
         damage:SetPoint("TOP", pip, "BOTTOM", 0, -3)
 
-        pips[i] = { frame = pip, border = border, bar = bar, maxBar = maxBar, damage = damage }
+        pips[i] = { frame = pip, border = border, glow = glow, pop = pop, bar = bar, maxBar = maxBar,
+            damage = damage }
     end
 
     return { frame = row, icon = icon, bigWindow = bigWindow, bigBar = bigBar, bigMaxWindow = bigMaxWindow,
@@ -465,12 +503,16 @@ local function targetAttackable()
     return true -- can't tell: show it
 end
 
-local function setBorder(pip, current)
-    if current then
-        pip.border:SetColorTexture(1, 0.82, 0, 1)
-    else
-        pip.border:SetColorTexture(0.3, 0.3, 0.3, 0.9)
+-- owned: you have this many combo points or more (gold ring). current: it's exactly your count (glow).
+local function setPoint(pip, owned, current)
+    local color = owned and OWNED_COLOR or EMPTY_COLOR
+    pip.border:SetVertexColor(color[1], color[2], color[3], 1)
+    pip.glow:SetShown(current)
+    if owned and not pip.owned then
+        pip.pop:Stop()
+        pip.pop:Play()
     end
+    pip.owned = owned
 end
 
 -- Test mode: every tracked spell's row, all lit, known or not (to place it on any character).
@@ -486,7 +528,7 @@ local function showTest()
                 pip.maxBar:SetValue(i >= 2 and 1 or 0)
                 pip.damage:SetText(i * 100)
                 pip.damage:SetTextColor(LEARNED_COLOR[1], LEARNED_COLOR[2], LEARNED_COLOR[3])
-                setBorder(pip, i == 3)
+                setPoint(pip, i <= 3, i == 3)
             end
             row.bigBar:SetMinMaxValues(0, 1)
             row.bigBar:SetValue(1)
@@ -548,7 +590,8 @@ local function update()
                 pip.damage:SetText(estimates[i] or "?")
                 pip.damage:SetTextColor(color[1], color[2], color[3])
                 pip.frame:SetAlpha(estimates[i] and 1 or 0.4)
-                setBorder(pip, ns.kinds[spell.kind].usesPoints and i == current)
+                local usesPoints = ns.kinds[spell.kind].usesPoints
+                setPoint(pip, usesPoints and i <= current, usesPoints and i == current)
             end
             row.bigDamage:SetText(estimates[1] or "?")
             row.bigDamage:SetTextColor(color[1], color[2], color[3])
